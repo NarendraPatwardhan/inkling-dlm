@@ -49,7 +49,7 @@ def train_step(pm, b, micro: int, limit: int | None = None) -> dict:
                                   b["n_ans"][idx], b["n_pad"][idx])
         w = len(idx) / Bc
         (loss * w).backward()
-        tot += float(loss) * w
+        tot += float(loss.detach()) * w
         ans += float(la) * w
         pad += float(lp) * w
     return dict(loss=tot, loss_answer=ans, loss_pad=pad, blocks=Bc, tower_width=int(b["ids"].shape[1]),

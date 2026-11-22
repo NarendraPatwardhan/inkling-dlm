@@ -57,6 +57,13 @@ The key is never printed or logged. Runs go to `narendra-patwardhan-independent/
 
 See [docs/RUNBOOK.md](docs/RUNBOOK.md) for the A100 procedure.
 
+## Verification status
+
+CPU (tiny random Inkling, real modeling code/config/tokenizer, real LAD data): `python -m pytest checks` — see
+`checks/` and docs/RUNBOOK.md. The full 399,998-row selection reproduces the guide's data statistics exactly
+(`checks/expected_data_stats.json`). GPU-only items (checkpoint load and dequantisation, grouped_mm on sm80, BF16
+equivalence, memory, speed and cost) are the stage-1 gates on the A100.
+
 ## Pins
 
 `transformers==5.24.0`, `peft==0.22.0`, `accelerate==1.16.0`; model `thinkingmachines/Inkling-2-Mini@b85c3cf`;

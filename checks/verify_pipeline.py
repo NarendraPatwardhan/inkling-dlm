@@ -38,6 +38,14 @@ def check_gates_train_sanity_end_to_end(cfg, tmp_path, groups):
     assert (tmp_path / "run" / "sanity.json").exists()
 
 
+def check_hardware_gate_stops_before_loading(cfg, tmp_path, monkeypatch):
+    c = _cfg(cfg, tmp_path, tiny=False, device="cuda")
+    called = []
+    monkeypatch.setattr(cli, "_bundle", lambda cfg: called.append(1))
+    out = cli.job_gates(c)
+    assert not out["passed"] and out["gates"][0]["gate"] == "G-hardware" and not called
+
+
 def check_speed_gate_stops_above_the_cu_limit(cfg, tmp_path, bundle):
     c = _cfg(cfg, tmp_path, cu_limit=1e-6, updates=25_000)
     r = g_speed(bundle, c, speed_batches(c, bundle.tok, 2))

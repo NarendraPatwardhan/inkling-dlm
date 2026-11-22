@@ -25,6 +25,19 @@ def result(name, passed, detail, **metrics):
 
 
 # ------------------------------------------------------------------------------------------------ load & dispatch
+def g_hardware(cfg, min_gpu_gb: float = 70.0):
+    """Before any download: the BF16 text model is ~52 GB, so only an 80 GB card can hold it (a 40 GB A100 cannot)."""
+    if cfg.tiny or not cfg.device.startswith("cuda"):
+        return result("G-hardware", True, f"device {cfg.device} (tiny verification)", skipped=True)
+    if not torch.cuda.is_available():
+        return result("G-hardware", False, "no CUDA device")
+    p = torch.cuda.get_device_properties(0)
+    gb = p.total_memory / 1e9
+    cap = torch.cuda.get_device_capability()
+    return result("G-hardware", gb >= min_gpu_gb and cap >= (8, 0),
+                  f"{p.name}, {gb:.0f} GB, capability {cap} (need >= {min_gpu_gb:.0f} GB, sm80+)", gpu_gb=gb)
+
+
 def g_load(bundle, cfg):
     if cfg.tiny:
         return result("G-load", True, "tiny random model (no checkpoint to load)", skipped=True)
@@ -182,7 +195,7 @@ def g_ckpt(bundle, cfg, groups):
         for n, p in pm.named_parameters():
             if "lora_B" in n:
                 p.normal_(0, 1e-3, generator=torch.Generator(device=p.device).manual_seed(0))
-    was = lm.is_gradient_checkpointing
+    was = lm.is_activation_checkpointing
     pm.train()
     grads = []
     for on in (False, True):
@@ -245,9 +258,9 @@ def g_speed(bundle, cfg, batches, tracker=None):
 
 
 # ------------------------------------------------------------------------------------------------ driver
-def run_gates(cfg, bundle, tracker, groups=None, speed=None) -> dict:
+def run_gates(cfg, bundle, tracker, groups=None, speed=None, pre=None) -> dict:
     t0 = time.time()
-    res = [g_load(bundle, cfg)]
+    res = list(pre or []) + [g_load(bundle, cfg)]
     if not res[-1]["passed"]:
         return _finish(cfg, tracker, res, t0)
     res.append(g_dispatch(bundle, cfg))

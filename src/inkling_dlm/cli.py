@@ -23,10 +23,16 @@ def _tracker(cfg, job, resume_id=None, extra=None):
 
 
 def job_gates(cfg, bundle=None) -> dict:
-    from .gates import run_gates
-    bundle = bundle or _bundle(cfg)
+    from .gates import _finish, g_hardware, run_gates
+    import time
     tr = _tracker(cfg, "gates")
-    out = run_gates(cfg, bundle, tr)
+    hw = g_hardware(cfg)
+    if not hw["passed"]:                                     # stop before downloading 20 GB of weights
+        out = _finish(cfg, tr, [hw], time.time())
+        tr.finish(exit_code=1)
+        return out
+    bundle = bundle or _bundle(cfg)
+    out = run_gates(cfg, bundle, tr, pre=[hw])
     tr.finish(exit_code=0 if out["passed"] else 1)
     return out
 
