@@ -1,0 +1,26 @@
+# CPU verification: tiny random Inkling built from the real config and modeling code; fp32 for tight comparisons.
+name: cpu-tiny
+tiny: true
+device: cpu
+dtype: float32
+experts_impl: grouped_mm
+updates: 12
+examples_per_update: 4
+warmup: 2
+lora_r: 8
+lora_alpha: 8
+micro_blocks: 8
+save_every: 2
+keep: 2
+eval_every: 6
+eval_batches: 1
+gate_updates: 4
+sample_max_blocks: 2
+copy_cases: 8
+cu_limit: 1.0e+12
+run_dir: .verify/runs/cpu-tiny
+stage_dir: .verify/stage
+cache_dir: .verify/cache
+data_local_dir: null
+wandb_mode: offline
+tags: [cpu, verify]

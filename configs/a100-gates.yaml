@@ -1,0 +1,21 @@
+# GPU gates only, without Drive (small experiment, < 5 CU): state and gates.json stay on the VM disk.
+name: gates
+device: cuda
+dtype: bfloat16
+experts_impl: grouped_mm
+updates: 25000
+examples_per_update: 16
+lora_r: 1024
+lora_alpha: 1024
+micro_blocks: 16
+grad_ckpt: false
+run_dir: /content/inkling-dlm/runs/gates
+stage_dir: /content/stage
+cache_dir: /content/inkling-dlm/cache
+gate_updates: 30
+cu_per_hour: 8.88
+cu_limit: 200
+mem_limit_gb: 76
+wandb_mode: online
+wandb_key_file: /content/wandb.key
+tags: [a100, gates]

@@ -1,0 +1,32 @@
+# Main run on one Colab A100 80GB (guide §6). The gates may switch grad_ckpt on and record it in run_dir/gates.json.
+name: main
+device: cuda
+dtype: bfloat16
+experts_impl: grouped_mm
+updates: 25000
+examples_per_update: 16
+lr: 1.0e-5
+lr_fwd: 1.0e-4
+weight_decay: 0.01
+warmup: 100
+clip: 0.5
+seed: 42
+lora_r: 1024
+lora_alpha: 1024
+micro_blocks: 16
+grad_ckpt: false
+maxlen: 256
+run_dir: /content/drive/MyDrive/inkling-dlm/runs/main
+stage_dir: /content/stage
+cache_dir: /content/drive/MyDrive/inkling-dlm/cache
+save_every: 500
+keep: 2
+eval_every: 1000
+eval_batches: 4
+gate_updates: 30
+cu_per_hour: 8.88
+cu_limit: 200
+mem_limit_gb: 76
+wandb_mode: online
+wandb_key_file: /content/wandb.key
+tags: [a100, main]
