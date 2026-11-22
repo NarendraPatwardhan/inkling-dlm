@@ -1,0 +1,29 @@
+# environments
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build-artifacts/
+# secrets: never commit keys or tokens
+*.key
+*.token
+.env
+.netrc
+secrets/
+# experiment outputs
+wandb/
+runs/
+outputs/
+artifacts/
+*.safetensors
+*.bin
+*.pt
+*.ckpt
+*.parquet
+*.arrow
+hf-cache/
+# local verification scratch
+.verify/
+.pytest_cache/
+# notebooks checkpoints
+.ipynb_checkpoints/

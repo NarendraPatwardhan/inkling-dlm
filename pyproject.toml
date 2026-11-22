@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "inkling-dlm"
+version = "0.1.0"
+description = "Frozen-tower block-diffusion conversion of Thinking Machines' Inkling 2 Mini (AR -> masked diffusion) on one A100"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Narendra Patwardhan" }]
+# Pins follow the guide (inkling-2-mini-ar-to-dlm-colab-a100, §6.8). torch is not pinned on Colab: keep the
+# runtime's build; gate G-dispatch requires grouped_mm support (torch >= 2.9 on sm80).
+dependencies = [
+    "torch>=2.9",
+    "transformers==5.24.0",
+    "peft==0.22.0",
+    "accelerate==1.16.0",
+    "huggingface_hub>=1.0",
+    "safetensors>=0.4",
+    "tokenizers>=0.22",
+    "pyarrow>=15",
+    "numpy>=1.26",
+    "pyyaml>=6",
+    "wandb>=0.22",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "nbformat>=5"]
+
+[project.scripts]
+inkling-dlm = "inkling_dlm.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+inkling_dlm = ["resources/*.npy", "resources/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["checks"]
+python_files = ["verify_*.py"]
+python_functions = ["check_*"]
+addopts = "-q"
