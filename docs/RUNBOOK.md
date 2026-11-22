@@ -18,7 +18,9 @@ tokenizer; no weights are downloaded. See `checks/` for what each file verifies.
 
 * **A100 80 GB** (`colab new --gpu A100 --high-mem`). The BF16 text model is about 52 GB; a 40 GB A100 cannot hold it.
   `G-hardware` checks this before anything is downloaded and stops the run otherwise.
-* High-RAM shape: loading dequantises the NVFP4/MXFP8 experts.
+* High-RAM shape: loading dequantises the NVFP4/MXFP8 experts. If the high-RAM A100 is unavailable
+  (`Service Unavailable` on assign), `colab_ctl.py gates --no-high-mem` tries the standard shape. A failed or
+  timed-out assign creates no session and costs nothing; confirm with `colab sessions` / `colab usage`.
 * Measured rate for budgeting: 8.88 CU/h (A100 80 GB); `colab usage` before and after every session.
 
 ## 2. Secrets

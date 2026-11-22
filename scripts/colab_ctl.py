@@ -219,6 +219,7 @@ def main():
     ap.add_argument("overrides", nargs="*")
     ap.add_argument("--gpu", default="A100")
     ap.add_argument("--high-mem", dest="high_mem", action="store_true", default=True)
+    ap.add_argument("--no-high-mem", dest="high_mem", action="store_false")
     ap.add_argument("--commit", default=None)
     ap.add_argument("--config", default="configs/a100-gates.yaml")
     ap.add_argument("--approved", action="store_true")
