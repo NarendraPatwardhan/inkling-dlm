@@ -96,7 +96,7 @@ def g_exact(bundle, cfg, groups):
     lora_on_dmax = (got_on - got).abs().max().item()
     # inference path: tower over prompt+answer prefix of row 0, sampler view, causal canvas
     r0, a0 = int(r[0]), int(a[0])
-    cache = tower_fill(pm, b["ids"][r0:r0 + 1, :a0 + 1])
+    cache = tower_fill(pm, b["ids"][r0:r0 + 1, :a0 + 1], record_past=True)   # as the sampler
     iview = view_from_inference_cache(pm, cache, a0 + 1, causal=True)
     got_inf = canvas_logits(pm, iview, b["ids"][r0:r0 + 1, a0:a0 + S + 1], adapters=False)
     want_inf = ref[r0, a0:a0 + S][None]
@@ -241,7 +241,7 @@ def g_speed(bundle, cfg, batches, tracker=None):
     ok = mem < cfg.mem_limit_gb and p["train_cu"] <= cfg.cu_limit
     return result("G-mem/speed", ok, f"grad_ckpt={cfg.grad_ckpt} micro={cfg.micro_blocks}: median {s:.2f} s/update, "
                   f"peak {mem:.1f} GB -> projected {p['train_hours']:.1f} h = {p['train_cu']:.0f} CU (limit "
-                  f"{cfg.cu_limit:.0f})", s_per_update=s, peak_mem_gb=mem, **p)
+                  f"{cfg.cu_limit:.0f})", peak_mem_gb=mem, **p)
 
 
 # ------------------------------------------------------------------------------------------------ driver

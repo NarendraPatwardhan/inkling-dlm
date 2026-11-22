@@ -71,11 +71,65 @@ def n_blocks(answer_len: int, ended: bool, block: int = K.S) -> int:
 
 
 def encode_all(tok, rows, maxlen: int):
-    return [encode(tok, r, maxlen) for r in rows]
+    """Batched `encode` (same output, one tokenizer call per field)."""
+    P = tok([prompt_text(r["instruction"], r["input"], r["system"]) for r in rows], add_special_tokens=False)
+    A = tok([r["output"] for r in rows], add_special_tokens=False)
+    out = []
+    for p, a in zip(P["input_ids"], A["input_ids"]):
+        a = a + [K.END_MSG_ID, K.EOS_ID]
+        ended = len(p) + len(a) <= maxlen
+        out.append((p, a[: max(0, maxlen - len(p))], ended))
+    return out
 
 
-def load_training_examples(cfg, tok):
-    """Encode the selection once and cache it (flat int32 arrays) under cache_dir, keyed by the data identity."""
+class EncodedSet:
+    """Compact encoded examples (flat int32 arrays); indexing returns (prompt_ids, answer_ids, ended)."""
+
+    def __init__(self, prompt, answer, plen, alen, ended):
+        self.prompt, self.answer = np.asarray(prompt, np.int32), np.asarray(answer, np.int32)
+        self.plen, self.alen, self.ended = np.asarray(plen, np.int64), np.asarray(alen, np.int64), np.asarray(ended)
+        self.po = np.concatenate([[0], np.cumsum(self.plen)])
+        self.ao = np.concatenate([[0], np.cumsum(self.alen)])
+
+    @classmethod
+    def from_examples(cls, data):
+        return cls(np.concatenate([np.asarray(p, np.int32) for p, _, _ in data]),
+                   np.concatenate([np.asarray(a, np.int32) for _, a, _ in data]),
+                   [len(p) for p, _, _ in data], [len(a) for _, a, _ in data], [e for _, _, e in data])
+
+    @classmethod
+    def concat(cls, parts):
+        return cls(np.concatenate([x.prompt for x in parts]), np.concatenate([x.answer for x in parts]),
+                   np.concatenate([x.plen for x in parts]), np.concatenate([x.alen for x in parts]),
+                   np.concatenate([x.ended for x in parts]))
+
+    def __len__(self):
+        return len(self.plen)
+
+    def __getitem__(self, i):
+        i = int(i)
+        return (self.prompt[self.po[i]:self.po[i + 1]].tolist(), self.answer[self.ao[i]:self.ao[i + 1]].tolist(),
+                bool(self.ended[i]))
+
+    def __iter__(self):
+        return (self[i] for i in range(len(self)))
+
+    @property
+    def lengths(self):
+        return self.plen + self.alen
+
+    def save(self, path):
+        np.savez(path, prompt=self.prompt, answer=self.answer, plen=self.plen, alen=self.alen, ended=self.ended)
+
+    @classmethod
+    def load(cls, path):
+        z = np.load(path)
+        return cls(z["prompt"], z["answer"], z["plen"], z["alen"], z["ended"])
+
+
+def load_training_examples(cfg, tok, chunk: int = 20_000):
+    """Encode the selection once (in chunks, straight into flat arrays) and cache it under cache_dir, keyed by the
+    data identity (repos, revisions, maxlen, selection hash)."""
     sel = selection_index()
     if cfg.max_examples:
         sel = sel[: cfg.max_examples]
@@ -85,40 +139,26 @@ def load_training_examples(cfg, tok):
     cache_dir = Path(cfg.cache_dir or Path(cfg.run_dir) / "cache")
     path = cache_dir / f"lad-train-{key}.npz"
     if path.exists():
-        z = np.load(path)
-        return _unflatten(z), {"data_id": key, "cached": True}
-    data = encode_all(tok, lad_rows(cfg, "train", sel), cfg.maxlen)
+        return EncodedSet.load(path), {"data_id": key, "cached": True}
+    parts = []
+    for i in range(0, len(sel), chunk):
+        parts.append(EncodedSet.from_examples(encode_all(tok, lad_rows(cfg, "train", sel[i:i + chunk]), cfg.maxlen)))
+        print(f"[data] encoded {min(len(sel), i + chunk)}/{len(sel)}", flush=True)
+    data = EncodedSet.concat(parts)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".partial.npz")
-    np.savez(tmp, **_flatten(data))
+    tmp = cache_dir / f"lad-train-{key}.partial.npz"
+    data.save(tmp)
     tmp.rename(path)
     return data, {"data_id": key, "cached": False}
 
 
-def _flatten(data):
-    pl = np.array([len(p) for p, _, _ in data], dtype=np.int32)
-    al = np.array([len(a) for _, a, _ in data], dtype=np.int32)
-    return dict(prompt=np.concatenate([np.asarray(p, np.int32) for p, _, _ in data]),
-                answer=np.concatenate([np.asarray(a, np.int32) for _, a, _ in data]),
-                plen=pl, alen=al, ended=np.array([e for _, _, e in data], dtype=bool))
-
-
-def _unflatten(z):
-    po = np.concatenate([[0], np.cumsum(z["plen"])])
-    ao = np.concatenate([[0], np.cumsum(z["alen"])])
-    P, A = z["prompt"], z["answer"]
-    return [(P[po[i]:po[i + 1]].tolist(), A[ao[i]:ao[i + 1]].tolist(), bool(z["ended"][i]))
-            for i in range(len(z["plen"]))]
-
-
 def data_stats(data, block: int = K.S) -> dict:
-    lens = np.array([len(p) + len(a) for p, a, _ in data])
-    ended = np.array([e for _, _, e in data])
-    blocks = sum(n_blocks(len(a), e, block) for _, a, e in data)
-    return dict(examples=len(data), truncated_frac=float(1 - ended.mean()), mean_len=float(lens.mean()),
-                mean_prompt=float(np.mean([len(p) for p, _, _ in data])),
-                mean_answer=float(np.mean([len(a) for _, a, _ in data])), blocks=int(blocks),
-                zero_block_examples=int(sum(n_blocks(len(a), e, block) == 0 for _, a, e in data)))
+    if not isinstance(data, EncodedSet):
+        data = EncodedSet.from_examples(list(data))
+    nb = np.where(data.ended, -(-data.alen // block), data.alen // block)
+    return dict(examples=len(data), truncated_frac=float(1 - data.ended.mean()), mean_len=float(data.lengths.mean()),
+                mean_prompt=float(data.plen.mean()), mean_answer=float(data.alen.mean()), blocks=int(nb.sum()),
+                zero_block_examples=int((nb == 0).sum()), real_tokens=int(data.lengths.sum()))
 
 
 def batch_order(lengths, seed: int, per_update: int):

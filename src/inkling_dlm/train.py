@@ -83,7 +83,8 @@ def run_training(cfg, bundle, tracker_factory, data=None) -> dict:
     else:
         dinfo = {"data_id": "provided", "cached": False}
     stats = data_stats(data, cfg.block)
-    order = batch_order(np.array([len(p) + len(a) for p, a, _ in data]), cfg.seed, cfg.examples_per_update)
+    lengths = data.lengths if hasattr(data, "lengths") else np.array([len(p) + len(a) for p, a, _ in data])
+    order = batch_order(lengths, cfg.seed, cfg.examples_per_update)
     opt, sched = make_optimizer(cfg, bundle)
     st = load_state(cfg, pm, opt, sched)
     step = st["step"] if st else 0

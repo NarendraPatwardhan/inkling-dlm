@@ -1,0 +1,10 @@
+{
+ "examples": 399998,
+ "truncated_frac": 0.05263776318881597,
+ "mean_len": 138.5682653413267,
+ "mean_prompt": 70.05450027250136,
+ "mean_answer": 68.51376506882535,
+ "blocks": 1052252,
+ "zero_block_examples": 0,
+ "real_tokens": 55427029
+}

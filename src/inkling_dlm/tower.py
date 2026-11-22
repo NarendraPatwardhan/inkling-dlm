@@ -64,7 +64,9 @@ def slice_seeds(seeds, idx):
 
 
 def view_from_inference_cache(peft_model, cache, n_tokens, causal=False):
-    """Batch-1 sampler: the tower cache holds positions 0..n_tokens-1; the anchor is the last one."""
+    """Batch-1 sampler: the tower cache holds positions 0..n_tokens-1; the anchor is the last one. The cache must be
+    filled with record_past=True (full sliding KV, see sampler.generate); conv seeds are the last kernel-1 inputs
+    before the anchor."""
     g = geometry(peft_model)
     dev = cache.layers[0].keys.device
     keys = [l.keys for l in cache.layers]

@@ -21,7 +21,9 @@ def generate(peft_model, prompt_ids, max_blocks=8, steps_per_block=32, block=S, 
     assert 1 <= block <= S
     dev = next(peft_model.parameters()).device
     ids = torch.tensor([list(prompt_ids)], device=dev)
-    cache = tower_fill(peft_model, ids)
+    # record_past keeps every sliding-layer key: the anchor slot at position n needs key n-(window-1), which a
+    # plain sliding cache (window-1 keys) has already dropped once the context exceeds the window.
+    cache = tower_fill(peft_model, ids, record_past=True)
     n, out = ids.shape[1], []
     for bi in range(max_blocks):
         view = view_from_inference_cache(peft_model, cache, n)
