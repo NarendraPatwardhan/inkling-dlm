@@ -61,6 +61,8 @@ class Tracker:
             group=cfg.name, config=conf, tags=list(cfg.tags) + [job_type] + (["tiny"] if cfg.tiny else []),
             mode=mode, id=resume_id, resume="allow" if resume_id else None,
             dir=os.environ.get("WANDB_DIR"), settings=wandb.Settings(console="off", quiet=True))
+        if mode == "online":
+            print(f"[wandb] run {self.run.id}: {self.run.url}", flush=True)
         self.run.define_metric("update", hidden=True)
         for prefix in ("train/*", "eval/*", "sys/*"):
             self.run.define_metric(prefix, step_metric="update")

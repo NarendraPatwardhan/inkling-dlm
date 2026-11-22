@@ -12,7 +12,7 @@ grad_ckpt: false
 run_dir: /content/inkling-dlm/runs/gates
 stage_dir: /content/stage
 cache_dir: /content/inkling-dlm/cache
-gate_updates: 30
+gate_updates: 20
 cu_per_hour: 8.88
 cu_limit: 200
 mem_limit_gb: 76

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run inkling-dlm jobs on a Colab GPU from a shell, detached, with the session stopped as soon as the job ends.
 
-  python scripts/colab_ctl.py up                 # balance, then a new A100 (high-RAM) session
+  python scripts/colab_ctl.py up                 # balance, then an 80 GB GPU: A100, else H100 (owner-approved)
   python scripts/colab_ctl.py push [--commit SHA]  # clone the public repo at SHA on the VM, install, upload the W&B key
   python scripts/colab_ctl.py launch gates [--config configs/a100-gates.yaml] [key=value ...]
   python scripts/colab_ctl.py status             # ALIVE/EXITED + GPU + log tail
@@ -49,15 +49,34 @@ def exec_code(code: str, t: int = 120) -> str:
         os.unlink(name)
 
 
-def balance() -> float | None:
+def _usage(field: str) -> float | None:
     r = colab("usage", capture=True)
     for line in (r.stdout or "").splitlines():
-        if "balance" in line.lower():
+        if field in line.lower():
             try:
-                return float(line.split(":")[1].split()[0])
+                return float(line.split(":")[1].split()[0].split("/")[0])
             except (IndexError, ValueError):
                 pass
     return None
+
+
+def balance() -> float | None:
+    return _usage("balance")
+
+
+def burn_rate() -> float | None:
+    return _usage("usage rate")
+
+
+def gpu_info() -> tuple[str, int]:
+    out = exec_code("import subprocess;print('GPU=' + subprocess.run(['nvidia-smi','--query-gpu=name,memory.total',"
+                    "'--format=csv,noheader,nounits'],capture_output=True,text=True).stdout.strip())", 90)
+    line = next((l for l in out.splitlines() if l.startswith("GPU=")), "GPU=unknown,0")[4:]
+    name, _, mem = line.rpartition(",")
+    try:
+        return name.strip(), int(mem)
+    except ValueError:
+        return line, 0
 
 
 def ledger(event: str, **kw):
@@ -66,16 +85,38 @@ def ledger(event: str, **kw):
         f.write(json.dumps(dict(t=time.strftime("%Y-%m-%dT%H:%M:%S%z"), event=event, session=SID, **kw)) + "\n")
 
 
+CANDIDATES = {                                   # tried in order; only 80 GB cards are kept
+    "A100": [("A100", True), ("A100", False)],
+    "H100": [("H100", True), ("H100", False)],
+    "auto": [("A100", True), ("A100", False), ("H100", True), ("H100", False)],
+}
+
+
 def cmd_up(a):
+    """Get an 80 GB GPU: A100 first, then H100 (owner-approved fallback). A card under 70 GB is released at once."""
     b = balance()
     print(f"balance before: {b} CU", flush=True)
     ledger("up", balance=b)
-    args = ["new", "-s", SID, "--gpu", a.gpu] + (["--high-mem"] if a.high_mem else [])
-    r = colab(*args, timeout=300)
-    if r.returncode != 0:
-        raise SystemExit(f"colab new failed ({r.returncode})")
-    print(exec_code("import subprocess;print(subprocess.run(['nvidia-smi','--query-gpu=name,memory.total',"
-                    "'--format=csv,noheader'],capture_output=True,text=True).stdout)", 60), flush=True)
+    for gpu, hm in CANDIDATES[a.gpu]:
+        if hm and not a.high_mem:
+            continue
+        print(f"=== trying {gpu}{' high-mem' if hm else ''} ===", flush=True)
+        r = colab(*(["new", "-s", SID, "--gpu", gpu] + (["--high-mem"] if hm else [])), timeout=300)
+        if r.returncode != 0:
+            time.sleep(5)
+            if SID not in (colab("sessions", capture=True).stdout or ""):
+                ledger("assign_failed", gpu=gpu, high_mem=hm)
+                continue
+        name, mem = gpu_info()
+        rate = burn_rate()
+        print(f"got {name} {mem} MiB, burn rate {rate} CU/h", flush=True)
+        ledger("assigned", gpu=name, mem_mib=mem, rate=rate, high_mem=hm)
+        if mem >= 70_000:
+            a.rate, a.gpu_name = rate, name
+            return
+        print("card under 70 GB: releasing it", flush=True)
+        colab("stop", "-s", SID, timeout=180)
+    raise SystemExit("no 80 GB GPU available")
 
 
 def cmd_push(a):
@@ -89,6 +130,10 @@ def sh(c):
     if r.returncode: raise SystemExit(r.returncode)
 os.makedirs({JOB!r}, exist_ok=True)
 sh("rm -rf {J} && git clone -q {REPO_URL} {J} && cd {J} && git checkout -q {sha} && git rev-parse HEAD")
+# prefetch the pinned checkpoint while the package installs (from_pretrained then reads the HF cache)
+pre = "from huggingface_hub import snapshot_download as s; s('thinkingmachines/Inkling-2-Mini', revision='b85c3cfa615fc413cc9af3379f491b963f3b586a'); print('PREFETCH DONE')"
+subprocess.Popen(["python", "-c", pre], stdout=open("{JOB}/prefetch.log", "w"), stderr=subprocess.STDOUT,
+                 stdin=subprocess.DEVNULL, start_new_session=True)
 sh("cd {J} && pip install -q -e . 2>&1 | tail -3")
 sh("python -c 'import torch, transformers, peft; print(torch.__version__, transformers.__version__, peft.__version__)'")
 '''
@@ -189,7 +234,7 @@ def cmd_wait(a):
             st = _state(cmd_status())
             if st in ("EXITED", "DEAD"):
                 break
-            if time.time() - t0 > a.max_hours * 3600:
+            if time.time() - t0 > getattr(a, "deadline_s", a.max_hours * 3600):
                 print("max wait reached", flush=True)
                 break
             time.sleep(a.poll)
@@ -200,15 +245,26 @@ def cmd_wait(a):
 
 
 def cmd_gates(a):
-    """The first A100 stage: every GPU gate, then stop. No training."""
+    """The first GPU stage: every gate, then stop. No training. The whole session is held to a CU budget."""
+    t_up = time.time()
     cmd_up(a)
     try:
         cmd_push(a)
+        rate = max(r for r in (a.rate, burn_rate(), 14.0 if "H100" in a.gpu_name else 8.88) if r)
+        end = t_up + a.cu_budget / rate * 3600 - 240                     # margin for pull + stop
+        print(f"budget {a.cu_budget} CU at {rate} CU/h -> job must end within {(end - time.time()) / 60:.0f} min",
+              flush=True)
+        ledger("budget", rate=rate, cu_budget=a.cu_budget, minutes_left=(end - time.time()) / 60)
+        if end - time.time() < 600:
+            raise SystemExit("not enough budget left for the gates")
+        gpu_tag = "h100" if "H100" in a.gpu_name else "a100"
         a.job, a.approved = "gates", False
+        a.overrides = list(a.overrides) + [f"cu_per_hour={rate}", f"tags=gates,{gpu_tag}"]
         cmd_launch(a)
     except BaseException:
         cmd_stop()
         raise
+    a.deadline_s = max(60.0, end - time.time())
     cmd_wait(a)
 
 
@@ -217,7 +273,8 @@ def main():
     ap.add_argument("cmd", choices=["up", "push", "launch", "status", "wait", "pull", "stop", "gates"])
     ap.add_argument("job", nargs="?", default="gates")
     ap.add_argument("overrides", nargs="*")
-    ap.add_argument("--gpu", default="A100")
+    ap.add_argument("--gpu", default="auto", choices=sorted(CANDIDATES))
+    ap.add_argument("--cu-budget", dest="cu_budget", type=float, default=5.0)
     ap.add_argument("--high-mem", dest="high_mem", action="store_true", default=True)
     ap.add_argument("--no-high-mem", dest="high_mem", action="store_false")
     ap.add_argument("--commit", default=None)
