@@ -36,11 +36,12 @@ def ledger(event, **kw):
 
 
 def with_timeout(client, read_s):
-    """Give every request of this client a (connect, read) timeout unless the caller set one."""
+    """Give every request of this client a (connect, client.read_s) timeout unless the caller set one."""
     orig = client.session.request
+    client.read_s = read_s
 
     def req(method, url, **kw):
-        kw.setdefault("timeout", (30, read_s))
+        kw.setdefault("timeout", (30, client.read_s))
         return orig(method, url, **kw)
     client.session.request = req
 
@@ -111,6 +112,8 @@ def run(state, name, gpu, high_mem, read_s, poll_s, step_s=20, sleep=time.sleep,
         ledger("assign_timeout", session=name, accelerator=accel.value, shape=shape_name, poll_s=poll_s)
         timed_out = True
     t_end = now() + poll_s
+    if hasattr(state.client, "read_s"):
+        state.client.read_s = 60       # poll reads are quick; a stalled one must not hold the poll past its window
     while True:
         try:
             got = state.client._get_assignment(nbh, variant, accel, shape)
