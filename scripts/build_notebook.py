@@ -6,11 +6,12 @@ import nbformat as nbf
 
 md, code = nbf.v4.new_markdown_cell, nbf.v4.new_code_cell
 cells = [
-    md("""# Inkling 2 Mini → block diffusion on one A100 80GB
+    md("""# Inkling 2 Mini → block diffusion on one A100 (40 GB is enough)
 
 This notebook drives the `inkling_dlm` package (https://github.com/NarendraPatwardhan/inkling-dlm). One flow:
 
-1. **Stage 1 — GPU gates** (≈ 15–25 min, a few CU): load (BF16 dequant, text path), dispatch (`grouped_mm`), LoRA-off
+1. **Stage 1 — GPU gates** (≈ 15–25 min, a few CU): load (experts kept packed NVFP4/MXFP8), dispatch (Unsloth's
+   packed-expert decode == transformers' dequantisation, bitwise; packed grouped GEMM vs the eager loop), LoRA-off
    logit equivalence, read-only cache, gradient flow, gradients through the cache under checkpointing, memory and
    speed with the **projected compute-unit cost**. Any failure — including a projection above 200 CU — stops here.
 2. **Stage 2 — training** (25,000 updates). Runs **only** when `TRAIN_APPROVED = True` (the owner's approval).
@@ -18,8 +19,9 @@ This notebook drives the `inkling_dlm` package (https://github.com/NarendraPatwa
 3. **Stage 3 — sanity checks** (held-out masked CE, copy test, code samples) and **stop the runtime**.
 
 Everything is logged to W&B (`narendra-patwardhan-independent/inkling-dlm`). The key is read from a Colab secret
-(`WANDB_API_KEY`) or `/content/wandb.key` and is never printed. Runtime: **A100, 80 GB** (the 40 GB A100 cannot hold
-the 52 GB BF16 model)."""),
+(`WANDB_API_KEY`) or `/content/wandb.key` and is never printed. Runtime: **any A100** (40 GB or 80 GB): the routed
+experts stay in the checkpoint's own 4-bit bytes (15.7 GB) and Unsloth's kernels decode them per layer, so the model
+holds ~19 GB instead of ~52 GB."""),
     code("""# Parameters
 REPO = "https://github.com/NarendraPatwardhan/inkling-dlm.git"
 COMMIT = "main"                  # pin a commit SHA for the real run
@@ -27,21 +29,25 @@ CONFIG = "configs/a100.yaml"
 TRAIN_APPROVED = False           # set True only after the owner has approved the main training run
 RUN_DIR = "/content/drive/MyDrive/inkling-dlm/runs/main"
 J = "/content/inkling-dlm\""""),
-    code("""# Hardware: the BF16 model is ~52 GB, so a 40 GB A100 cannot run this
+    code("""# Hardware: any A100 (40 GB holds the packed model, ~19 GB, plus training state)
 import subprocess
 gpu = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
                      capture_output=True, text=True).stdout.strip()
 print(gpu)
 name, mem = gpu.rsplit(",", 1)
-assert "A100" in name and int(mem) > 70_000, f"need an A100 80GB runtime, got {gpu}"
+assert "A100" in name and int(mem) > 39_000, f"need an A100 runtime, got {gpu}"
 """),
-    code("""# Install the package at the pinned commit (keeps Colab's torch; pins transformers/peft/accelerate)
+    code("""# Install the package at the pinned commit (keeps Colab's torch; pins transformers/peft/accelerate), then
+# Unsloth (packed-expert kernels) without its dependency pins (they would downgrade transformers below 5.24)
 import os
 if not os.path.exists(J):
     !git clone -q {REPO} {J}
 !cd {J} && git fetch -q origin && git checkout -q {COMMIT} && git log -1 --format='%H %s'
 !pip install -q -e {J}
-!python -c "import torch, transformers, peft; print(torch.__version__, transformers.__version__, peft.__version__)"
+import sys; sys.path.insert(0, f"{J}/src")
+from inkling_dlm.constants import UNSLOTH
+!pip install -q --no-deps {" ".join(f'"{p}"' for p in UNSLOTH)}
+!python -c "import torch, transformers, peft, triton; print(torch.__version__, transformers.__version__, peft.__version__, triton.__version__)"
 """),
     code("""# Google Drive: checkpoints, data cache, gates.json, sanity.json
 from google.colab import drive
@@ -99,7 +105,7 @@ runtime.unassign()
 """),
 ]
 nb = nbf.v4.new_notebook(cells=cells, metadata={
-    "accelerator": "GPU", "colab": {"gpuType": "A100", "machine_shape": "hm", "provenance": []},
+    "accelerator": "GPU", "colab": {"gpuType": "A100", "provenance": []},
     "kernelspec": {"display_name": "Python 3", "name": "python3"}, "language_info": {"name": "python"}})
 for i, c in enumerate(nb.cells):
     c.id = f"cell-{i:02d}"                          # deterministic ids: regeneration is byte-identical

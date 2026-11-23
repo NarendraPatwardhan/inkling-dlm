@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run inkling-dlm jobs on a Colab GPU from a shell, detached, with the session stopped as soon as the job ends.
 
-  python scripts/colab_ctl.py up                 # balance, then an 80 GB GPU: A100, else H100 (owner-approved)
+  python scripts/colab_ctl.py up                 # balance, then any A100 (40 GB is enough with packed experts)
   python scripts/colab_ctl.py push [--commit SHA]  # clone the public repo at SHA on the VM, install, upload the W&B key
   python scripts/colab_ctl.py launch gates [--config configs/a100-gates.yaml] [key=value ...]
   python scripts/colab_ctl.py status             # ALIVE/EXITED + GPU + log tail
@@ -85,15 +85,14 @@ def ledger(event: str, **kw):
         f.write(json.dumps(dict(t=time.strftime("%Y-%m-%dT%H:%M:%S%z"), event=event, session=SID, **kw)) + "\n")
 
 
-CANDIDATES = {                                   # tried in order; only 80 GB cards are kept
-    "A100": [("A100", True), ("A100", False)],
-    "H100": [("H100", True), ("H100", False)],
-    "auto": [("A100", True), ("A100", False), ("H100", True), ("H100", False)],
+CANDIDATES = {                                   # tried in order: the standard shape, then high-RAM
+    "A100": [("A100", False), ("A100", True)],
 }
+MIN_MIB = 39_000                                 # a 40 GB A100 reports 40960 MiB
 
 
 def cmd_up(a):
-    """Get an 80 GB GPU: A100 first, then H100 (owner-approved fallback). A card under 70 GB is released at once."""
+    """Get an A100 (40 or 80 GB). Anything smaller is released at once."""
     b = balance()
     print(f"balance before: {b} CU", flush=True)
     ledger("up", balance=b)
@@ -111,12 +110,12 @@ def cmd_up(a):
         rate = burn_rate()
         print(f"got {name} {mem} MiB, burn rate {rate} CU/h", flush=True)
         ledger("assigned", gpu=name, mem_mib=mem, rate=rate, high_mem=hm)
-        if mem >= 70_000:
+        if mem >= MIN_MIB:
             a.rate, a.gpu_name = rate, name
             return
-        print("card under 70 GB: releasing it", flush=True)
+        print(f"card under {MIN_MIB} MiB: releasing it", flush=True)
         colab("stop", "-s", SID, timeout=180)
-    raise SystemExit("no 80 GB GPU available")
+    raise SystemExit("no A100 available")
 
 
 def cmd_push(a):
@@ -135,7 +134,14 @@ pre = "from huggingface_hub import snapshot_download as s; s('thinkingmachines/I
 subprocess.Popen(["python", "-c", pre], stdout=open("{JOB}/prefetch.log", "w"), stderr=subprocess.STDOUT,
                  stdin=subprocess.DEVNULL, start_new_session=True)
 sh("cd {J} && pip install -q -e . 2>&1 | tail -3")
-sh("python -c 'import torch, transformers, peft; print(torch.__version__, transformers.__version__, peft.__version__)'")
+pins = subprocess.run(["python", "-c", "from inkling_dlm.constants import UNSLOTH; print(*UNSLOTH, sep=chr(10))"],
+                      cwd={J!r}, capture_output=True, text=True).stdout.split(chr(10))
+pins = [p for p in pins if p.strip()]
+r = subprocess.run(["pip", "install", "-q", "--no-deps", *pins], capture_output=True, text=True)  # keeps transformers 5.24
+print("unsloth", [p.rsplit("@", 1)[-1][:9] for p in pins], "->", r.returncode, r.stderr[-800:])
+if r.returncode: raise SystemExit(r.returncode)
+sh("python -c 'import torch, transformers, peft, triton; print(torch.__version__, transformers.__version__, peft.__version__, triton.__version__)'")
+sh("cd {J} && python -c 'import inkling_dlm.quant as q; print(q.IMPL)'")
 '''
     print(exec_code(code, 900), flush=True)
     if WANDB_KEY.is_file():
@@ -250,14 +256,14 @@ def cmd_gates(a):
     cmd_up(a)
     try:
         cmd_push(a)
-        rate = max(r for r in (a.rate, burn_rate(), 14.0 if "H100" in a.gpu_name else 8.88) if r)
+        rate = max(r for r in (a.rate, burn_rate(), 8.88) if r)          # 8.88: measured A100 80 GB rate
         end = t_up + a.cu_budget / rate * 3600 - 240                     # margin for pull + stop
         print(f"budget {a.cu_budget} CU at {rate} CU/h -> job must end within {(end - time.time()) / 60:.0f} min",
               flush=True)
         ledger("budget", rate=rate, cu_budget=a.cu_budget, minutes_left=(end - time.time()) / 60)
         if end - time.time() < 600:
             raise SystemExit("not enough budget left for the gates")
-        gpu_tag = "h100" if "H100" in a.gpu_name else "a100"
+        gpu_tag = "a100-40gb" if "40GB" in a.gpu_name.replace(" ", "") else "a100"
         a.job, a.approved = "gates", False
         a.overrides = list(a.overrides) + [f"cu_per_hour={rate}", f"tags=gates,{gpu_tag}"]
         cmd_launch(a)
@@ -273,7 +279,7 @@ def main():
     ap.add_argument("cmd", choices=["up", "push", "launch", "status", "wait", "pull", "stop", "gates"])
     ap.add_argument("job", nargs="?", default="gates")
     ap.add_argument("overrides", nargs="*")
-    ap.add_argument("--gpu", default="auto", choices=sorted(CANDIDATES))
+    ap.add_argument("--gpu", default="A100", choices=sorted(CANDIDATES))
     ap.add_argument("--cu-budget", dest="cu_budget", type=float, default=5.0)
     ap.add_argument("--high-mem", dest="high_mem", action="store_true", default=True)
     ap.add_argument("--no-high-mem", dest="high_mem", action="store_false")
