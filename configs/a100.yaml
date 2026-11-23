@@ -1,8 +1,9 @@
-# Main run on one Colab A100 80GB (guide §6). The gates may switch grad_ckpt on and record it in run_dir/gates.json.
+# Main run on one Colab A100 40 GB (any A100): experts stay packed NVFP4/MXFP8 (docs/RUNBOOK.md, 4-bit route).
+# The gates may switch grad_ckpt on / lower micro_blocks and record the setting in run_dir/gates.json.
 name: main
 device: cuda
 dtype: bfloat16
-experts_impl: grouped_mm
+experts_impl: unsloth_packed
 updates: 25000
 examples_per_update: 16
 lr: 1.0e-5
@@ -26,7 +27,7 @@ eval_batches: 4
 gate_updates: 30
 cu_per_hour: 8.88
 cu_limit: 200
-mem_limit_gb: 76
+mem_limit_gb: 38
 wandb_mode: online
 wandb_key_file: /content/wandb.key
 tags: [a100, main]

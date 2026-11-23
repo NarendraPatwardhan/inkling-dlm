@@ -2,7 +2,7 @@
 name: gates
 device: cuda
 dtype: bfloat16
-experts_impl: grouped_mm
+experts_impl: unsloth_packed
 updates: 25000
 examples_per_update: 16
 lora_r: 1024
@@ -15,7 +15,7 @@ cache_dir: /content/inkling-dlm/cache
 gate_updates: 20
 cu_per_hour: 8.88
 cu_limit: 200
-mem_limit_gb: 76
+mem_limit_gb: 38
 wandb_mode: online
 wandb_key_file: /content/wandb.key
 tags: [a100, gates]

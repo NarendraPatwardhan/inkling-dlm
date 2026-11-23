@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from . import quant
 from .constants import S
 from .cost import projection
 from .data import collate, encode_all, eval_batches, lad_rows, selection_index
@@ -25,8 +26,9 @@ def result(name, passed, detail, **metrics):
 
 
 # ------------------------------------------------------------------------------------------------ load & dispatch
-def g_hardware(cfg, min_gpu_gb: float = 70.0):
-    """Before any download: the BF16 text model is ~52 GB, so only an 80 GB card can hold it (a 40 GB A100 cannot)."""
+def g_hardware(cfg, min_gpu_gb: float = 39.0):
+    """Before any download. With the experts packed (15.7 GB) the model needs ~19 GB resident, so a 40 GB A100
+    (42.4e9 bytes) qualifies; the BF16-dequantised alternative (~52 GB) would need an 80 GB card."""
     if cfg.tiny or not cfg.device.startswith("cuda"):
         return result("G-hardware", True, f"device {cfg.device} (tiny verification)", skipped=True)
     if not torch.cuda.is_available():
@@ -34,8 +36,10 @@ def g_hardware(cfg, min_gpu_gb: float = 70.0):
     p = torch.cuda.get_device_properties(0)
     gb = p.total_memory / 1e9
     cap = torch.cuda.get_device_capability()
-    return result("G-hardware", gb >= min_gpu_gb and cap >= (8, 0),
-                  f"{p.name}, {gb:.0f} GB, capability {cap} (need >= {min_gpu_gb:.0f} GB, sm80+)", gpu_gb=gb)
+    need = min_gpu_gb if cfg.experts_impl == quant.IMPL else 70.0
+    return result("G-hardware", gb >= need and cap >= (8, 0),
+                  f"{p.name}, {gb:.1f} GB, capability {cap} (need >= {need:.0f} GB, sm80+)", gpu_gb=gb,
+                  gpu=p.name)
 
 
 def g_load(bundle, cfg):
@@ -47,26 +51,111 @@ def g_load(bundle, cfg):
     mism = list(info.get("mismatched_keys", []))
     lm = bundle.pm.base_model.model
     dtypes = sorted({str(p.dtype) for p in lm.parameters()})
-    return result("G-load", not missing and not unexpected and not mism,
+    packed = quant.packed_bytes(lm)
+    n_mod = len(quant.experts_modules(lm))
+    ok = not missing and not unexpected and not mism
+    if cfg.experts_impl == quant.IMPL:
+        ok &= info.get("packed_modules") == n_mod and set(packed) == {"nvfp4", "mxfp8"}
+    mem = torch.cuda.memory_allocated() / 1e9 if cfg.device.startswith("cuda") else 0.0
+    return result("G-load", ok,
                   f"missing {len(missing)}, unexpected non-vision/MTP {len(unexpected)}, mismatched {len(mism)}; "
-                  f"dtypes {dtypes}", missing=missing[:20], unexpected=unexpected[:20])
+                  f"dtypes {dtypes}; packed experts {', '.join(f'{k} {v / 1e9:.2f} GB' for k, v in packed.items())} "
+                  f"in {info.get('packed_modules')}/{n_mod} modules; allocated after load {mem:.2f} GB",
+                  missing=missing[:20], unexpected=unexpected[:20], allocated_gb=mem,
+                  **{f"packed_{k}_gb": v / 1e9 for k, v in packed.items()})
+
+
+def _layer(name: str) -> int:
+    return int(name.split("layers.")[1].split(".")[0])
+
+
+def _eager_moe(x, gate_up, down, act, idx, w):
+    """transformers' eager expert loop (Inkling2LoopExperts.forward) on given dense weights."""
+    out = torch.zeros_like(x, dtype=torch.float32)
+    for e in range(gate_up.shape[0]):
+        tok, pos = torch.where(idx == e)
+        if tok.numel() == 0:
+            continue
+        g, u = torch.nn.functional.linear(x[tok], gate_up[e]).chunk(2, dim=-1)
+        h = torch.nn.functional.linear(act(g, u), down[e]) * w[tok, pos, None]
+        out.index_add_(0, tok, h.to(out.dtype))
+    return out.to(x.dtype)
 
 
 def g_dispatch(bundle, cfg):
-    """grouped_mm is selected (not the silent Python-loop fallback) and agrees with the reference expert loop."""
+    """Packed experts: (1) Unsloth's decode of the packed bytes equals transformers' own BF16 dequantisation of the
+    raw checkpoint tensors, bitwise, on NVFP4 and MXFP8 layers (the 4-bit model IS the BF16-loaded parent);
+    (2) the packed grouped forward and its input gradient agree with the eager expert loop on those dense weights.
+    BF16 path: grouped_mm is selected and agrees with the eager loop."""
     lm = bundle.pm.base_model.model
     impl = getattr(lm.config, "_experts_implementation", None)
-    ok, parts = impl == cfg.experts_impl, [f"experts_implementation={impl}"]
+    ok, parts, metrics = impl == cfg.experts_impl, [f"experts_implementation={impl}"], {}
     if torch.cuda.is_available() and cfg.device.startswith("cuda"):
         cap = torch.cuda.get_device_capability()
         has = hasattr(torch.nn.functional, "grouped_mm") or hasattr(torch, "_grouped_mm")
         ok &= cap >= (8, 0) and has
         parts.append(f"capability {cap}, torch {torch.__version__}, grouped_mm available {has}")
-    # functional comparison on one MoE block: grouped_mm vs eager
-    moe = next(m for n, m in lm.named_modules() if n.endswith("mlp.experts"))
-    x = torch.randn(64, lm.config.hidden_size, device=moe.gate_up_proj.device, dtype=moe.gate_up_proj.dtype)
+    mods = quant.experts_modules(lm)
     E, k = lm.config.n_routed_experts, lm.config.num_experts_per_tok
     g = torch.Generator(device="cpu").manual_seed(0)
+    if impl == quant.IMPL:
+        by_layer = {_layer(n): m for n, m in mods}
+        nv = sorted(L for L, m in by_layer.items() if m.down_proj.packed_format == "nvfp4")
+        mx = sorted(L for L, m in by_layer.items() if m.down_proj.packed_format == "mxfp8")
+        loop0 = lm.config.loop_layer_index_start
+        pick = sorted(set(nv[:1] + nv[-1:] + mx[:1] + mx[-1:] + [loop0]) & set(by_layer))
+        mism, total, worst = 0, 0, 0.0
+        fwd_rel, dx_rel = 0.0, 0.0
+        tf_diff, tf_rel = 0, 0.0           # transformers' from_pretrained casts amax to the model dtype first
+        for L in pick:
+            mod = by_layer[L]
+            dev = mod.down_proj.device
+            dt = mod.down_proj.packed_dtype
+            raw = quant.raw_layer(bundle.expert_source, L, dev)
+            dense = {}
+            for prefix, pname, inter in quant.STACKS:
+                ref = quant.reference_dequant(raw, prefix, inter, dt)
+                got = getattr(mod, pname).dequantize(dt)
+                d = ref != got
+                mism += int(d.sum())
+                total += ref.numel()
+                worst = max(worst, float(((ref.float() - got.float()).abs() / ref.float().abs().clamp(min=1e-30))
+                                         [d].max()) if d.any() else 0.0)
+                dense[pname] = ref
+                if quant.is_nvfp4(raw, prefix) and dt != torch.float32:
+                    tf = quant.reference_dequant(quant.as_from_pretrained(raw, prefix, dt), prefix, inter, dt)
+                    tf_diff += int((tf != ref).sum())
+                    tf_rel = max(tf_rel, float(((tf.float() - ref.float()).abs()
+                                                / ref.float().abs().clamp(min=1e-30)).max()))
+                    del tf
+                del got
+            del raw
+            x = torch.randn(64, lm.config.hidden_size, generator=g).to(dev, dt).requires_grad_(True)
+            idx = torch.stack([torch.randperm(E, generator=g)[:k] for _ in range(64)]).to(dev)
+            w = torch.rand(64, k, generator=g).to(dev, dt)
+            y = mod(x, idx, w)
+            xr = x.detach().clone().requires_grad_(True)
+            yr = _eager_moe(xr, dense["gate_up_proj"], dense["down_proj"], mod.act_fn, idx, w)
+            gy = torch.randn(y.shape, generator=g).to(dev, dt)
+            y.backward(gy)
+            yr.backward(gy)
+            rel = lambda a, b: ((a.float() - b.float()).norm() / b.float().norm().clamp(min=1e-12)).item()
+            fwd_rel, dx_rel = max(fwd_rel, rel(y, yr)), max(dx_rel, rel(x.grad, xr.grad))
+            del dense, y, yr
+        # fp32 (tiny) decodes in a different order than transformers (e2m1*(s*g) vs (e2m1*s)*g): <= 1 fp32 ulp.
+        exact = mism == 0 if dt != torch.float32 else worst <= 2.4e-7
+        tol = 2e-2 if dt == torch.bfloat16 else 1e-5
+        ok &= exact and fwd_rel < tol and dx_rel < tol
+        parts.append(f"decode vs transformers dequant on layers {pick}: {mism}/{total} values differ "
+                     f"(max rel {worst:.1e}); packed vs eager loop rel diff fwd {fwd_rel:.2e}, dX {dx_rel:.2e} "
+                     f"(tol {tol}); for reference, transformers' BF16 from_pretrained (amax rounded to BF16) "
+                     f"differs in {tf_diff}/{total} values, max rel {tf_rel:.1e}")
+        metrics = dict(decode_mismatches=mism, decode_values=total, decode_max_rel=worst, rel_diff=fwd_rel,
+                       dx_rel_diff=dx_rel, layers=pick, bf16_load_mismatches=tf_diff, bf16_load_max_rel=tf_rel)
+        return result("G-dispatch", ok, "; ".join(parts), **metrics)
+    # BF16 path: grouped_mm vs eager on one MoE block
+    moe = mods[0][1]
+    x = torch.randn(64, lm.config.hidden_size, device=moe.gate_up_proj.device, dtype=moe.gate_up_proj.dtype)
     top_k_index = torch.stack([torch.randperm(E, generator=g)[:k] for _ in range(64)]).to(x.device)
     top_k_weights = torch.rand(64, k, generator=g).to(x.device, x.dtype)
     outs = {}
@@ -228,33 +317,57 @@ def speed_batches(cfg, tok, n):
     return [data[i * G:(i + 1) * G] for i in range(n)]
 
 
+def mem_limit_gb(cfg) -> float:
+    """cfg.mem_limit_gb, capped at 92% of the device (allocator caching, CUDA context and fragmentation live above
+    max_memory_allocated)."""
+    if cfg.device.startswith("cuda") and torch.cuda.is_available():
+        return min(cfg.mem_limit_gb, 0.92 * torch.cuda.get_device_properties(0).total_memory / 1e9)
+    return cfg.mem_limit_gb
+
+
 def g_speed(bundle, cfg, batches, tracker=None):
-    """Real-data updates (forward+backward, no optimizer step) in the current setting; project the full run.
-    Stops (FAIL) if the projection exceeds cfg.cu_limit or peak memory exceeds cfg.mem_limit_gb."""
+    """Real-data updates in the current setting, each a full update (forward + backward + AdamW step on the
+    trainable tensors, so optimizer state is in the memory peak); project the full run. FAIL if the projection exceeds
+    cfg.cu_limit or peak memory exceeds the limit. Run last: it moves the trainable tensors."""
+    from .train import make_optimizer
     pm, dev = bundle.pm, cfg.device
     pm.train()
+    opt, _ = make_optimizer(cfg, bundle)
     if dev.startswith("cuda"):
+        torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-    times = []
+    times, toks, slots = [], [], []
     for i, ex in enumerate(batches):
         b = collate(ex, i, cfg.seed, dev, cfg.block)
         sync(dev)
         t0 = time.time()
         out = train_step(pm, b, cfg.micro_blocks)
+        torch.nn.utils.clip_grad_norm_(bundle.lora + bundle.fwd, cfg.clip)
+        opt.step()
+        opt.zero_grad(set_to_none=True)
         sync(dev)
         times.append(time.time() - t0)
-        pm.zero_grad(set_to_none=True)
+        toks.append(int(b["lens"].sum()))
+        slots.append(out["blocks"] * (S + 1))
         if tracker:
             tracker.log({"gate_speed/s_per_update": times[-1], "gate_speed/loss": out["loss"],
-                         "gate_speed/blocks": out["blocks"], "gate_speed/peak_mem_gb": peak_mem_gb(dev)})
+                         "gate_speed/blocks": out["blocks"], "gate_speed/tower_tokens": toks[-1],
+                         "gate_speed/tokens_per_s": toks[-1] / times[-1],
+                         "gate_speed/peak_mem_gb": peak_mem_gb(dev)})
+    del opt
     warm = min(5, len(times) - 1)
     s = float(np.median(times[warm:]))
+    tps = float(np.sum(toks[warm:]) / np.sum(times[warm:]))
+    cps = float(np.sum(slots[warm:]) / np.sum(times[warm:]))
     mem = peak_mem_gb(dev)
+    lim = mem_limit_gb(cfg)
     p = projection(s, cfg.updates, cfg.cu_per_hour)
-    ok = mem < cfg.mem_limit_gb and p["train_cu"] <= cfg.cu_limit
+    ok = mem < lim and p["train_cu"] <= cfg.cu_limit
     return result("G-mem/speed", ok, f"grad_ckpt={cfg.grad_ckpt} micro={cfg.micro_blocks}: median {s:.2f} s/update, "
-                  f"peak {mem:.1f} GB -> projected {p['train_hours']:.1f} h = {p['train_cu']:.0f} CU (limit "
-                  f"{cfg.cu_limit:.0f})", peak_mem_gb=mem, **p)
+                  f"{tps:.0f} tower tokens/s, {cps:.0f} canvas slots/s, peak {mem:.1f} GB (limit {lim:.1f}) -> "
+                  f"projected {p['train_hours']:.1f} h = {p['train_cu']:.0f} CU at {cfg.cu_per_hour} CU/h (limit "
+                  f"{cfg.cu_limit:.0f})", peak_mem_gb=mem, mem_limit_gb=lim, tokens_per_s=tps,
+                  canvas_slots_per_s=cps, **p)
 
 
 # ------------------------------------------------------------------------------------------------ driver
@@ -269,27 +382,34 @@ def run_gates(cfg, bundle, tracker, groups=None, speed=None, pre=None) -> dict:
         res.append(fn(bundle, cfg, groups))
     if all(r["passed"] for r in res):
         speed = speed if speed is not None else speed_batches(cfg, bundle.tok, cfg.gate_updates)
-        try:
-            r = g_speed(bundle, cfg, speed, tracker)
-        except torch.OutOfMemoryError:
-            r = result("G-mem/speed", False, f"OOM with grad_ckpt={cfg.grad_ckpt} micro={cfg.micro_blocks}")
-        if not r["passed"] and not cfg.grad_ckpt:
-            torch.cuda.empty_cache() if torch.cuda.is_available() else None
-            print("[gates] retrying the speed gate with gradient checkpointing on", flush=True)
-            cfg.grad_ckpt = True
-            bundle.pm.base_model.model.gradient_checkpointing_enable(
-                gradient_checkpointing_kwargs={"use_reentrant": False})
-            res.append(r | {"gate": "G-mem/speed (no ckpt)"})
+        # settings tried in order until one passes: as configured, then checkpointing on, then smaller micro-batches
+        tries = [(cfg.grad_ckpt, cfg.micro_blocks)]
+        tries += [(True, m) for m in (cfg.micro_blocks, cfg.micro_blocks // 2, cfg.micro_blocks // 4)
+                  if m >= 4 and (True, m) not in tries]
+        for n, (ck, micro) in enumerate(tries):
+            cfg.grad_ckpt, cfg.micro_blocks = ck, micro
+            lm = bundle.pm.base_model.model
+            if ck:
+                lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            else:
+                lm.gradient_checkpointing_disable()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             try:
                 r = g_speed(bundle, cfg, speed, tracker)
             except torch.OutOfMemoryError:
-                r = result("G-mem/speed", False, "OOM with gradient checkpointing on")
-        res.append(r)
+                bundle.pm.zero_grad(set_to_none=True)
+                r = result("G-mem/speed", False, f"OOM with grad_ckpt={ck} micro={micro}")
+            if r["passed"] or n == len(tries) - 1:
+                res.append(r)
+                break
+            res.append(r | {"gate": f"G-mem/speed (tried ckpt={ck} micro={micro})"})
+            print("[gates] speed gate failed in this setting; trying the next one", flush=True)
     return _finish(cfg, tracker, res, t0)
 
 
 def _finish(cfg, tracker, res, t0):
-    passed = all(r["passed"] for r in res if not r["gate"].endswith("(no ckpt)"))
+    passed = all(r["passed"] for r in res if not r["gate"].startswith("G-mem/speed (tried"))
     speed = next((r for r in reversed(res) if r["gate"] == "G-mem/speed"), None)
     out = dict(passed=passed, gates=res, seconds=time.time() - t0,
                setting=dict(grad_ckpt=cfg.grad_ckpt, micro_blocks=cfg.micro_blocks),

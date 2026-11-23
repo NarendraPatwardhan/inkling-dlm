@@ -21,7 +21,7 @@ class RunConfig:
     tiny: bool = False                    # CPU verification: random tiny Inkling built from the real config/code
     dtype: str = "bfloat16"
     device: str = "cuda"
-    experts_impl: str = "grouped_mm"      # forced: transformers would otherwise silently fall back to a Python loop
+    experts_impl: str = "unsloth_packed"  # packed NVFP4/MXFP8 experts (Unsloth kernels); "grouped_mm" = BF16 (80 GB)
     # data
     data_repo: str = K.DATA_REPO
     data_revision: str = K.DATA_REVISION
@@ -55,7 +55,7 @@ class RunConfig:
     gate_updates: int = 30
     cu_per_hour: float = 8.88
     cu_limit: float = 200.0
-    mem_limit_gb: float = 76.0
+    mem_limit_gb: float = 38.0            # also capped at 92% of the device by the speed gate
     exact_top1_min: float = 0.995
     exact_dlogit_max: float = 0.1
     ckpt_grad_rel_max: float = 1e-2
