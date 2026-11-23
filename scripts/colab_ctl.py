@@ -91,8 +91,24 @@ CANDIDATES = {                                   # tried in order: the standard 
 MIN_MIB = 39_000                                 # a 40 GB A100 reports 40960 MiB
 
 
+CPY = os.environ.get("COLAB_PY", os.path.expanduser("~/.local/share/uv/tools/google-colab-cli/bin/python"))
+
+
+def assign(gpu: str, hm: bool) -> int:
+    """scripts/colab_assign.py: reuse/adopt/request, long read timeout, polls a timed-out POST (see its docstring)."""
+    cmd = [CPY, str(ROOT / "scripts/colab_assign.py"), "--session", SID, "--gpu", gpu] + (["--high-mem"] if hm else [])
+    try:
+        return subprocess.run(cmd, timeout=1500).returncode       # its own bound: 600 s read + 600 s poll
+    except subprocess.TimeoutExpired:
+        return 5
+
+
+def orphans(*flags) -> int:
+    return subprocess.run([CPY, str(ROOT / "scripts/colab_orphans.py"), *flags], timeout=300).returncode
+
+
 def cmd_up(a):
-    """Get an A100 (40 or 80 GB). Anything smaller is released at once."""
+    """Get an A100 (40 or 80 GB). Anything smaller is released at once. A card a timed-out assign left is adopted."""
     b = balance()
     print(f"balance before: {b} CU", flush=True)
     ledger("up", balance=b)
@@ -100,12 +116,16 @@ def cmd_up(a):
         if hm and not a.high_mem:
             continue
         print(f"=== trying {gpu}{' high-mem' if hm else ''} ===", flush=True)
-        r = colab(*(["new", "-s", SID, "--gpu", gpu] + (["--high-mem"] if hm else [])), timeout=300)
-        if r.returncode != 0:
-            time.sleep(5)
-            if SID not in (colab("sessions", capture=True).stdout or ""):
-                ledger("assign_failed", gpu=gpu, high_mem=hm)
+        rc = assign(gpu, hm)
+        if rc != 0:
+            if SID in (colab("sessions", capture=True).stdout or ""):
+                rc = 0                                            # landed anyway: use it
+            else:
+                ledger("assign_failed", gpu=gpu, high_mem=hm, rc=rc)
+                if rc == 5:                                       # POST timed out: a card may still land; a second
+                    break                                         # POST now could get two. Next try adopts it.
                 continue
+        orphans("--unassign", "--all")                            # we hold ours; release any extra card at once
         name, mem = gpu_info()
         rate = burn_rate()
         print(f"got {name} {mem} MiB, burn rate {rate} CU/h", flush=True)
@@ -128,6 +148,10 @@ def sh(c):
     print(c[:80], "->", r.returncode); print(r.stdout[-1500:], r.stderr[-1500:])
     if r.returncode: raise SystemExit(r.returncode)
 os.makedirs({JOB!r}, exist_ok=True)
+try:                                           # a reused/adopted card may still run an earlier try's job
+    os.killpg(int(open("{JOB}/run.pid").read()), 9)
+except Exception:
+    pass
 sh("rm -rf {J} && git clone -q {REPO_URL} {J} && cd {J} && git checkout -q {sha} && git rev-parse HEAD")
 # prefetch the pinned checkpoint while the package installs (from_pretrained then reads the HF cache)
 pre = "from huggingface_hub import snapshot_download as s; s('thinkingmachines/Inkling-2-Mini', revision='b85c3cfa615fc413cc9af3379f491b963f3b586a'); print('PREFETCH DONE')"
