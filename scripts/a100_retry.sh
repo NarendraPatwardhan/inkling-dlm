@@ -10,7 +10,7 @@ LOG=outputs/colab/retry; mkdir -p $LOG
 CPY=${COLAB_PY:-$HOME/.local/share/uv/tools/google-colab-cli/bin/python}
 orph() { $CPY scripts/colab_orphans.py --unassign "$@" 2>&1 | tail -3; return ${PIPESTATUS[0]}; }
 i=$(ls $LOG/attempt-*.log 2>/dev/null | wc -l)
-trap 'echo "=== stopping $(date -Is) ==="; orph --all; colab sessions 2>&1 | grep -q "\[inkling-a100\]" && colab stop -s inkling-a100; echo "RETRY_EXIT rc=signal attempt=$i"; exit 1' INT TERM
+trap 'echo "=== stopping $(date -Is) ==="; orph --all; colab sessions 2>&1 | grep -q "\[inkling-a100\]" && colab stop -s inkling-a100; echo "RETRY_EXIT rc=signal attempt=$i"; exit 1' INT TERM HUP
 while true; do
   i=$((i+1)); t0=$(date +%s)
   echo "=== attempt $i $(date -Is) ==="

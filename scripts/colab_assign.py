@@ -5,8 +5,9 @@
 Order: (1) a live local session NAME is reused; (2) a live orphan of the wanted accelerator (assigned server-side, no
 local session; e.g. a POST that timed out on an earlier try) is adopted; (3) a new assignment is requested with a long
 read timeout (the CLI's google-auth session defaults to 120 s, shorter than an A100 cold provision). If the POST
-times out or drops, the same notebook hash is polled (GET /tun/m/assign returns the assignment once it exists) and
-the assignment list is watched for a new endpoint, until --poll seconds pass. Adoption writes the same SessionState
+times out, drops, or the front end answers 500/502/504 (it gave up on a slow provision), the same notebook hash is
+polled (GET /tun/m/assign returns the assignment once it exists) and the assignment list is watched for a new
+endpoint, until --poll seconds pass. Adoption writes the same SessionState
 `colab new` writes, so every later `colab exec/upload/stop -s NAME` works on it.
 exit 0 = session NAME ready (prints one JSON line), 3 = no capacity, 4 = refused (quota/entitlement/too many),
 5 = POST timed out and nothing appeared yet (it may still land: the next try adopts it; do not POST again now).
@@ -97,9 +98,14 @@ def run(state, name, gpu, high_mem, read_s, poll_s, step_s=20, sleep=time.sleep,
     except ColabRequestError as e:
         code = get_status_code(e)
         print(f"[assign] backend {code}: {getattr(e.response, 'reason', '')}", flush=True)
-        if code != 503 and code is not None and code < 500:
+        if code == 503:                # answered: no capacity; one look for a late assignment below
+            poll_s = 0
+        elif code in (500, 502, 504):  # the front end gave up on a slow provision: the card may still land
+            print(f"[assign] polling the assignment for up to {poll_s}s", flush=True)
+            ledger("assign_timeout", session=name, accelerator=accel.value, shape=shape_name, poll_s=poll_s, code=code)
+            timed_out = True
+        else:
             return 4
-        poll_s = 0                     # 5xx answered: normally no capacity; one look for a late assignment below
     except TRANSIENT as e:
         print(f"[assign] POST {type(e).__name__}: polling the assignment for up to {poll_s}s", flush=True)
         ledger("assign_timeout", session=name, accelerator=accel.value, shape=shape_name, poll_s=poll_s)
