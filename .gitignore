@@ -27,3 +27,5 @@ hf-cache/
 .pytest_cache/
 # notebooks checkpoints
 .ipynb_checkpoints/
+# unsloth kernel compile cache
+unsloth_compiled_cache/

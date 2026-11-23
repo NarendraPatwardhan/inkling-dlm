@@ -1,5 +1,7 @@
-"""Model construction: the real Inkling 2 Mini (text path, BF16, grouped_mm forced) or a tiny random Inkling built
-from the real config and modeling code for CPU verification. Both get the same LoRA + forward-bias-bank wrapping."""
+"""Model construction: the real Inkling 2 Mini (text path; BF16 non-expert weights, routed experts kept in the
+checkpoint's packed NVFP4/MXFP8 bytes and decoded by Unsloth's kernels) or a tiny random Inkling built from the real
+config and modeling code for CPU verification, whose experts go through the same checkpoint layout and packed path.
+Both get the same LoRA + forward-bias-bank wrapping."""
 from __future__ import annotations
 
 import json
@@ -11,6 +13,7 @@ from transformers import AutoTokenizer
 from transformers.models.inkling2_loop.configuration_inkling2_loop import Inkling2LoopTextConfig
 from transformers.models.inkling2_loop.modeling_inkling2_loop import Inkling2LoopForCausalLM
 
+from . import quant
 from .patches import add_forward_bias_bank, apply_patches
 
 LORA_TARGET = r".*\.self_attn\.(q_proj|v_proj)\.linear"   # the inner nn.Linear of the clipped projections
@@ -23,6 +26,7 @@ class Bundle:
     fwd: list                  # forward-bias-bank parameters
     lora: list                 # LoRA parameters
     load_info: dict | None
+    expert_source: object = None   # raw checkpoint expert tensors: safetensors path (real) or dict (tiny)
 
 
 def load_tokenizer(cfg):
@@ -56,7 +60,7 @@ def tiny_text_config(cfg, *, window: int | None = None) -> Inkling2LoopTextConfi
     )
 
 
-def _wrap(cfg, model, tok, info) -> Bundle:
+def _wrap(cfg, model, tok, info, source=None) -> Bundle:
     model.requires_grad_(False)
     apply_patches()
     lcfg = LoraConfig(r=cfg.lora_r, lora_alpha=cfg.lora_alpha, lora_dropout=0.0, bias="none",
@@ -70,7 +74,10 @@ def _wrap(cfg, model, tok, info) -> Bundle:
         raise RuntimeError(f"nothing to train: {len(lora)} LoRA tensors, {len(fwd)} bias banks")
     if cfg.grad_ckpt:
         pm.base_model.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-    return Bundle(tok=tok, pm=pm, fwd=fwd, lora=lora, load_info=info)
+    return Bundle(tok=tok, pm=pm, fwd=fwd, lora=lora, load_info=info, expert_source=source)
+
+
+TINY_MXFP8_LAST = 2      # the release keeps its last 4 of 24 layers in MXFP8; the tiny model its last 2 of 6
 
 
 def build_tiny(cfg, *, window: int | None = None, seed: int = 0) -> Bundle:
@@ -78,10 +85,18 @@ def build_tiny(cfg, *, window: int | None = None, seed: int = 0) -> Bundle:
     tc = tiny_text_config(cfg, window=window)
     tc._attn_implementation = "eager"
     model = Inkling2LoopForCausalLM(tc).to(cfg.torch_dtype)
+    source = None
+    if cfg.experts_impl == quant.IMPL:
+        # random dense experts -> the checkpoint's own layout (NVFP4 + MXFP8, interleaved gate/up) -> packed stacks
+        source = quant.quantize_like_checkpoint(model, TINY_MXFP8_LAST)
+        quant.register()
+        for name, mod in quant.experts_modules(model):
+            layer = int(name.split("layers.")[1].split(".")[0])
+            quant.install(mod, quant.raw_layer(source, layer, "cpu"), cfg.torch_dtype)
     model.config._experts_implementation = cfg.experts_impl
     _set_experts_impl(model, cfg.experts_impl)
     tok = load_tokenizer(cfg)
-    return _wrap(cfg, model.to(cfg.device), tok, None)
+    return _wrap(cfg, model.to(cfg.device), tok, None, source)
 
 
 def _set_experts_impl(model, impl):
@@ -91,6 +106,9 @@ def _set_experts_impl(model, impl):
 
 def load_real(cfg) -> Bundle:
     tok = load_tokenizer(cfg)
+    if cfg.experts_impl == quant.IMPL:
+        model, info = quant.load_packed(cfg.model_repo, cfg.model_revision, cfg.device, cfg.torch_dtype)
+        return _wrap(cfg, model, tok, info, info["checkpoint"])
     model, info = Inkling2LoopForCausalLM.from_pretrained(
         cfg.model_repo, revision=cfg.model_revision, dtype=cfg.torch_dtype, device_map={"": 0},
         attn_implementation="eager", experts_implementation=cfg.experts_impl, output_loading_info=True)
