@@ -185,3 +185,10 @@ def check_release_layout_loads_packed(release_layout):
             with torch.no_grad():
                 a, b = ref(input_ids=ids).logits, pk(input_ids=ids).logits
             assert (a - b).abs().max() < 1e-5
+
+
+def check_placement_plain_cuda():
+    """cfg.device "cuda" (the A100 configs) must map to a real index: device_map {"": None} broke from_pretrained."""
+    assert quant.placement("cuda")[1] == {"": 0} and quant.placement("cuda")[0] == torch.device("cuda", 0)
+    assert quant.placement("cuda:1")[1] == {"": 1}
+    assert quant.placement("cpu") == (torch.device("cpu"), {"": "cpu"})

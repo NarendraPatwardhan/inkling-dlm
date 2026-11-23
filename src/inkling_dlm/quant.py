@@ -210,13 +210,20 @@ def checkpoint_file(repo: str, revision: str | None) -> str:
     return hf_hub_download(repo, "model-00001-of-00001.safetensors", revision=revision)
 
 
+def placement(device) -> tuple[torch.device, dict]:
+    """(device, transformers device_map). Plain "cuda" has index None, and device_map {"": None} breaks loading."""
+    dev = torch.device(device)
+    if dev.type == "cuda" and dev.index is None:
+        dev = torch.device("cuda", torch.cuda.current_device() if torch.cuda.is_available() else 0)
+    return dev, {"": dev.index if dev.type == "cuda" else str(dev)}
+
+
 def load_packed(repo: str, revision: str | None, device, dtype=torch.bfloat16):
     """Inkling2LoopForCausalLM with non-expert weights loaded by transformers and every experts module filled with the
     checkpoint's own packed bytes. Returns (model, load_info) where load_info lists only genuine problems."""
     from transformers.models.inkling2_loop.modeling_inkling2_loop import Inkling2LoopForCausalLM
     register()
-    dev = torch.device(device)
-    device_map = {"": dev.index if dev.type == "cuda" else str(dev)}
+    dev, device_map = placement(device)
     with experts_left_out() as dropped:
         model, info = Inkling2LoopForCausalLM.from_pretrained(
             repo, revision=revision, dtype=dtype, device_map=device_map, attn_implementation="eager",
