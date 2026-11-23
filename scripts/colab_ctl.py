@@ -275,9 +275,10 @@ def cmd_wait(a):
 
 
 def cmd_gates(a):
-    """The first GPU stage: every gate, then stop. No training. The whole session is held to a CU budget."""
+    """The first GPU stage: every gate. No training. The A100 session is kept afterwards, pass or fail."""
     t_up = time.time()
     cmd_up(a)
+    a.keep = True
     try:
         cmd_push(a)
         rate = max(r for r in (a.rate, burn_rate(), 8.88) if r)          # 8.88: measured A100 80 GB rate
@@ -292,7 +293,7 @@ def cmd_gates(a):
         a.overrides = list(a.overrides) + [f"cu_per_hour={rate}", f"tags=gates,{gpu_tag}"]
         cmd_launch(a)
     except BaseException:
-        cmd_stop()
+        ledger("kept", session=SID, note="gates setup failed; A100 held")
         raise
     a.deadline_s = max(60.0, end - time.time())
     cmd_wait(a)
