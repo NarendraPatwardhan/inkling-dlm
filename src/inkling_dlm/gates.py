@@ -4,19 +4,21 @@ MICRO_BLOCKS setting and the cost projection) next to the run's checkpoints."""
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from . import quant
+from . import quant, unsloth_ops
 from .constants import S
 from .cost import projection
-from .data import collate, encode_all, eval_batches, lad_rows, selection_index
+from .data import batch_order, collate, encode_all, eval_batches, lad_rows, n_blocks, selection_index
 from .evaluate import tower_states
 from .tower import canvas_logits, tower_fill, view_for_batch, view_from_inference_cache
-from .train import peak_mem_gb, sync, train_step
+from .train import peak_mem_gb, peak_reserved_gb, sync, train_step
+from .unsloth_ops import set_dequant_chunk_mb
 
 
 def result(name, passed, detail, **metrics):
@@ -56,12 +58,19 @@ def g_load(bundle, cfg):
     ok = not missing and not unexpected and not mism
     if cfg.experts_impl == quant.IMPL:
         ok &= info.get("packed_modules") == n_mod and set(packed) == {"nvfp4", "mxfp8"}
+    # Unsloth guide, "Correct loss": the loop message gates must stay out of 4-bit (quantised, the first losses are
+    # 3.4-3.9 instead of 0.4-1.2). Only routed experts are packed here; check every message-gate weight is 16/32-bit.
+    gates_w, bad_gates, n_msg = _message_parts(bundle, lm)
+    ok &= bool(gates_w) and not bad_gates and n_msg == bundle.message_ckpt > 0
     mem = torch.cuda.memory_allocated() / 1e9 if cfg.device.startswith("cuda") else 0.0
     return result("G-load", ok,
                   f"missing {len(missing)}, unexpected non-vision/MTP {len(unexpected)}, mismatched {len(mism)}; "
                   f"dtypes {dtypes}; packed experts {', '.join(f'{k} {v / 1e9:.2f} GB' for k, v in packed.items())} "
-                  f"in {info.get('packed_modules')}/{n_mod} modules; allocated after load {mem:.2f} GB",
-                  missing=missing[:20], unexpected=unexpected[:20], allocated_gb=mem,
+                  f"in {info.get('packed_modules')}/{n_mod} modules; message gates 16-bit "
+                  f"{len(gates_w) - len(bad_gates)}/{len(gates_w)}; message residuals under Unsloth's checkpoint "
+                  f"{n_msg}; allocated after load {mem:.2f} GB",
+                  missing=missing[:20], unexpected=unexpected[:20], allocated_gb=mem, message_gates=len(gates_w),
+                  message_gates_not_16bit=bad_gates[:20], message_residuals_checkpointed=n_msg,
                   **{f"packed_{k}_gb": v / 1e9 for k, v in packed.items()})
 
 
@@ -275,7 +284,7 @@ def g_grad(bundle, cfg, groups):
 
 def g_ckpt(bundle, cfg, groups):
     """Same canvases with gradient checkpointing off vs on: identical gradients (read-only cache replay is safe,
-    and the prompt is not silently dropped under checkpointing)."""
+    the prompt is not silently dropped under checkpointing, and Unsloth's message-residual recompute is exact)."""
     pm = bundle.pm
     lm = pm.base_model.model
     b = collate(groups[0], 3, cfg.seed, cfg.device, cfg.block)
@@ -292,7 +301,12 @@ def g_ckpt(bundle, cfg, groups):
             lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         else:
             lm.gradient_checkpointing_disable()
-        grads.append(_grads(pm, b, cfg, limit=8))
+        with unsloth_ops.count_message_math() as msg:
+            grads.append(_grads(pm, b, cfg, limit=8))
+        if on:
+            msg_calls = msg.calls
+        else:
+            msg_off = msg.calls
     if not was:
         lm.gradient_checkpointing_disable()
     with torch.no_grad():
@@ -305,16 +319,31 @@ def g_ckpt(bundle, cfg, groups):
     c = torch.cat([grads[1][n].flatten() for n in keys])
     rel = ((a - c).norm() / a.norm().clamp(min=1e-12)).item()
     same_keys = set(grads[0]) == set(grads[1])
-    return result("G-ckpt", same_keys and rel < cfg.ckpt_grad_rel_max,
-                  f"relative grad difference {rel:.2e} over {len(keys)} tensors", rel=rel)
+    # Unsloth's message-residual recompute must engage under checkpointing (forward + backward recompute) and only there
+    msg_ok = msg_off == 0 and msg_calls > 0
+    return result("G-ckpt", same_keys and rel < cfg.ckpt_grad_rel_max and msg_ok,
+                  f"relative grad difference {rel:.2e} over {len(keys)} tensors; checkpointed message-residual calls "
+                  f"{msg_calls} with checkpointing, {msg_off} without", rel=rel, message_calls=msg_calls)
 
 
 # ------------------------------------------------------------------------------------------------ speed & cost
 def speed_batches(cfg, tok, n):
-    sel = selection_index()[: n * cfg.examples_per_update]
-    data = encode_all(tok, lad_rows(cfg, "train", sel), cfg.maxlen)
+    """n updates shaped like training: length-bucketed groups (data.batch_order, as run_training builds them) from the
+    head of the selection, so canvases per update and tower width follow the training distribution."""
     G = cfg.examples_per_update
-    return [data[i * G:(i + 1) * G] for i in range(n)]
+    data = encode_all(tok, lad_rows(cfg, "train", selection_index()[: max(n, 50) * G]), cfg.maxlen)
+    order = batch_order([len(p) + len(a) for p, a, _ in data], cfg.seed, G)
+    return [[data[i] for i in grp] for grp in order[:n]]
+
+
+def peak_batch(cfg, tok, pool: int | None = None):
+    """The worst update for memory: the examples_per_update rows with the most answer blocks (then the longest) among
+    the first `pool` selected rows, i.e. the most canvases per micro-batch and the widest tower."""
+    pool = pool or (400 if cfg.tiny else 4000)
+    data = encode_all(tok, lad_rows(cfg, "train", selection_index()[:pool]), cfg.maxlen)
+    key = sorted(range(len(data)), key=lambda i: (n_blocks(len(data[i][1]), data[i][2], cfg.block),
+                                                   len(data[i][0]) + len(data[i][1])), reverse=True)
+    return [data[i] for i in key[: cfg.examples_per_update]]
 
 
 def mem_limit_gb(cfg) -> float:

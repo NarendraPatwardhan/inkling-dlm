@@ -8,6 +8,7 @@ from transformers.cache_utils import DynamicCache
 
 from .constants import S
 from .patches import PrefixView, build_view
+from .unsloth_ops import token_ce
 
 
 def parts(peft_model):
@@ -89,14 +90,26 @@ def view_for_batch(peft_model, keys, values, seeds, b, idx, causal=False) -> Pre
                       dtype=keys[0].dtype, causal=causal)
 
 
-def canvas_logits(peft_model, view, canvas_ids, select=None, adapters=True):
+def canvas_hidden(peft_model, view, canvas_ids, select=None, adapters=True):
     """canvas_ids: (Bc, S+1) = [anchor, S block slots]. Slot j's output predicts block position j (token n+j+1).
-    Returns softcapped float logits for the selected (Bc, S) slots, or all S if select is None."""
+    Returns the final hidden states of the selected (Bc, S) slots (flat), or of all S slots if select is None."""
     lm, text = parts(peft_model)
     ctx = contextlib.nullcontext() if adapters else peft_model.disable_adapter()
     with ctx:
         h = text(input_ids=canvas_ids, attention_mask=view.masks, position_ids=view.position_ids,
                  cache=view, use_cache=False).last_hidden_state[:, :S]
-    if select is not None:
-        h = h[select]
+    return h if select is None else h[select]
+
+
+def canvas_logits(peft_model, view, canvas_ids, select=None, adapters=True):
+    """Softcapped float logits of `canvas_hidden` (gates and the sampler; training scores through `canvas_ce`)."""
+    lm = parts(peft_model)[0]
+    h = canvas_hidden(peft_model, view, canvas_ids, select, adapters)
     return lm.logit_softcap(lm.lm_head(h).float())     # same order as Inkling2LoopForCausalLM.forward (1531-1535)
+
+
+def canvas_ce(peft_model, view, canvas_ids, select, targets, adapters=True):
+    """Per-slot cross entropy at `targets` for the selected slots, through Unsloth's chunked softcapped CE: the
+    [slots, 200,058] fp32 logits are never kept for backward (unsloth_ops.token_ce)."""
+    lm = parts(peft_model)[0]
+    return token_ce(lm, canvas_hidden(peft_model, view, canvas_ids, select, adapters), targets)

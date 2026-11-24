@@ -15,7 +15,7 @@ from .cost import projection
 from .data import batch_order, collate, data_stats, eval_batches, load_training_examples
 from .evaluate import heldout_ce, tower_states
 from .loss import block_loss
-from .tower import canvas_logits, view_for_batch
+from .tower import canvas_ce, view_for_batch
 
 
 def seed_all(seed: int):
@@ -33,6 +33,21 @@ def peak_mem_gb(dev) -> float:
     return torch.cuda.max_memory_allocated() / 1e9 if torch.device(dev).type == "cuda" else 0.0
 
 
+def peak_reserved_gb(dev) -> float:
+    return torch.cuda.max_memory_reserved() / 1e9 if torch.device(dev).type == "cuda" else 0.0
+
+
+def apply_memory_setting(cfg, bundle) -> None:
+    """Make the model follow cfg (grad_ckpt, dequant_chunk_mb), whatever state the gates or a previous job left."""
+    from .unsloth_ops import set_dequant_chunk_mb
+    lm = bundle.pm.base_model.model
+    if cfg.grad_ckpt:
+        lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    else:
+        lm.gradient_checkpointing_disable()
+    set_dequant_chunk_mb(cfg.dequant_chunk_mb)
+
+
 def train_step(pm, b, micro: int, limit: int | None = None) -> dict:
     """Forward + backward for one batch (gradients accumulate on the trainable tensors). limit: gate use only."""
     k, v, s = tower_states(pm, b)
@@ -43,10 +58,9 @@ def train_step(pm, b, micro: int, limit: int | None = None) -> dict:
         idx = torch.arange(c0, min(Bc, c0 + micro), device=dev)
         view = view_for_batch(pm, k, v, s, b, idx)
         sel = b["masked"][idx]
-        logits = canvas_logits(pm, view, b["canvas"][idx], select=sel)
+        ce = canvas_ce(pm, view, b["canvas"][idx], sel, b["tgt"][idx][sel])
         blk = sel.nonzero()[:, 0]
-        loss, la, lp = block_loss(logits, b["tgt"][idx][sel], b["t"][idx][blk], b["region"][idx][sel], blk,
-                                  b["n_ans"][idx], b["n_pad"][idx])
+        loss, la, lp = block_loss(ce, b["t"][idx][blk], b["region"][idx][sel], blk, b["n_ans"][idx], b["n_pad"][idx])
         w = len(idx) / Bc
         (loss * w).backward()
         tot += float(loss.detach()) * w
@@ -138,6 +152,7 @@ def run_training(cfg, bundle, tracker_factory, data=None) -> dict:
                      "train/grad_norm_fwd": gn_fwd, "train/lr_lora": lr[0], "train/lr_fwd": lr[1],
                      "sys/s_per_update": dt, "sys/blocks": out["blocks"], "sys/tower_width": out["tower_width"],
                      "sys/masked_slots": out["masked_slots"], "sys/peak_mem_gb": peak_mem_gb(dev),
+                     "sys/peak_reserved_gb": peak_reserved_gb(dev),
                      "sys/projected_train_cu": proj["train_cu"],
                      "sys/remaining_h": med * (cfg.updates - step) / 3600}, update=step)
         stop_now = cfg.stop_after is not None and step >= cfg.stop_after

@@ -1,4 +1,5 @@
-"""Block loss against a direct per-slot reference, and block collation rules."""
+"""Block loss against a direct per-slot reference, Unsloth's chunked softcapped CE against the plain logits path,
+and block collation rules."""
 import math
 
 import torch
@@ -39,7 +40,8 @@ def check_block_loss_matches_reference():
     masked = torch.rand(Bc, S, generator=g) < t[:, None]
     masked[:, 0] = True
     blk = masked.nonzero()[:, 0]
-    loss, la, lp = block_loss(logits[masked], tgt[masked], t[blk], region[masked], blk,
+    ce = F.cross_entropy(logits[masked], tgt[masked], reduction="none")
+    loss, la, lp = block_loss(ce, t[blk], region[masked], blk,
                               (region == 0).sum(1).float(), (region == 1).sum(1).float())
     assert math.isclose(loss.item(), _reference(logits, tgt, t, region, masked), rel_tol=1e-5)
     assert la.item() >= 0 and lp.item() >= 0
@@ -78,3 +80,34 @@ def check_train_step_loss_is_finite_and_near_uniform(cfg, bundle, groups):
     assert math.isfinite(out["loss"]) and out["blocks"] == b["rows"].shape[0]
     # a random tiny model is near-uniform over the 200,058 logits: per-token CE ~ ln V, inflated by 1/t on average
     assert out["loss_answer"] > 0.5 * math.log(200_058)
+
+
+def check_chunked_softcap_ce_matches_logits_path(cfg, bundle, groups, fresh_lora):
+    """tower.canvas_ce (Unsloth's chunked CE with the final logit softcap) gives the same per-slot CE and the same
+    gradients as F.cross_entropy on canvas_logits (lm_head -> float -> softcap), with non-zero LoRA-B."""
+    from inkling_dlm.evaluate import tower_states
+    from inkling_dlm.tower import canvas_ce, canvas_logits, view_for_batch
+    pm = bundle.pm
+    with torch.no_grad():
+        for n, p in pm.named_parameters():
+            if "lora_B" in n:
+                p.normal_(0, 1e-2, generator=torch.Generator().manual_seed(1))
+    b = collate(groups[0], 5, cfg.seed, cfg.device, cfg.block)
+    k, v, s = tower_states(pm, b)
+    idx = torch.arange(min(6, b["rows"].shape[0]))
+    sel, tgt = b["masked"][idx], b["tgt"][idx][b["masked"][idx]]
+    params = [p for p in pm.parameters() if p.requires_grad]
+    out = []
+    for fused in (False, True):
+        view = view_for_batch(pm, k, v, s, b, idx)
+        if fused:
+            ce = canvas_ce(pm, view, b["canvas"][idx], sel, tgt)
+        else:
+            ce = F.cross_entropy(canvas_logits(pm, view, b["canvas"][idx], select=sel), tgt, reduction="none")
+        w = torch.linspace(0.5, 2.0, ce.shape[0])
+        grads = torch.autograd.grad((ce * w).sum(), params, allow_unused=True)
+        out.append((ce.detach(), torch.cat([g.flatten() for g in grads if g is not None])))
+    (ce0, g0), (ce1, g1) = out
+    assert ce0.shape == ce1.shape and ce0.numel() == int(sel.sum())
+    assert (ce0 - ce1).abs().max().item() < 1e-4 * max(1.0, ce0.abs().max().item())
+    assert ((g0 - g1).norm() / g0.norm()).item() < 1e-4

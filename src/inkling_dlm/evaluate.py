@@ -2,11 +2,10 @@
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 
 from .constants import MASK_ID
 from .data import collate
-from .tower import canvas_logits, compact_training_states, geometry, tower_fill, view_for_batch
+from .tower import canvas_ce, compact_training_states, geometry, tower_fill, view_for_batch
 
 T_GRID = (0.1, 0.3, 0.5, 0.7, 0.9)
 
@@ -36,8 +35,8 @@ def heldout_ce(pm, groups, cfg, adapters=True, micro=None) -> dict:
             for c0 in range(0, Bc, micro):
                 idx = torch.arange(c0, min(Bc, c0 + micro), device=dev)
                 view = view_for_batch(pm, k, v, s, b, idx)
-                lg = canvas_logits(pm, view, canvas[idx], select=m[idx], adapters=adapters)
-                acc[tt][0] += F.cross_entropy(lg, b["tgt"][idx][m[idx]], reduction="sum").item()
+                ce = canvas_ce(pm, view, canvas[idx], m[idx], b["tgt"][idx][m[idx]], adapters=adapters)
+                acc[tt][0] += ce.sum().item()
                 acc[tt][1] += int(m[idx].sum())
     pm.train(was_training)
     out = {f"ce_t{tt:.1f}": c / max(1, n) for tt, (c, n) in acc.items()}

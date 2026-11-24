@@ -13,7 +13,7 @@ from transformers import AutoTokenizer
 from transformers.models.inkling2_loop.configuration_inkling2_loop import Inkling2LoopTextConfig
 from transformers.models.inkling2_loop.modeling_inkling2_loop import Inkling2LoopForCausalLM
 
-from . import quant
+from . import quant, unsloth_ops
 from .patches import add_forward_bias_bank, apply_patches
 
 LORA_TARGET = r".*\.self_attn\.(q_proj|v_proj)\.linear"   # the inner nn.Linear of the clipped projections
@@ -27,6 +27,7 @@ class Bundle:
     lora: list                 # LoRA parameters
     load_info: dict | None
     expert_source: object = None   # raw checkpoint expert tensors: safetensors path (real) or dict (tiny)
+    message_ckpt: int = 0          # loop message residuals under Unsloth's checkpointed recompute
 
 
 def load_tokenizer(cfg):
@@ -66,6 +67,7 @@ def _wrap(cfg, model, tok, info, source=None) -> Bundle:
     lcfg = LoraConfig(r=cfg.lora_r, lora_alpha=cfg.lora_alpha, lora_dropout=0.0, bias="none",
                       target_modules=LORA_TARGET)
     pm = get_peft_model(model, lcfg)
+    n_msg = unsloth_ops.checkpoint_message_inputs(pm.base_model.model)
     fwd = add_forward_bias_bank(pm)
     for p in fwd:
         p.requires_grad_(True)
@@ -74,7 +76,7 @@ def _wrap(cfg, model, tok, info, source=None) -> Bundle:
         raise RuntimeError(f"nothing to train: {len(lora)} LoRA tensors, {len(fwd)} bias banks")
     if cfg.grad_ckpt:
         pm.base_model.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-    return Bundle(tok=tok, pm=pm, fwd=fwd, lora=lora, load_info=info, expert_source=source)
+    return Bundle(tok=tok, pm=pm, fwd=fwd, lora=lora, load_info=info, expert_source=source, message_ckpt=n_msg)
 
 
 TINY_MXFP8_LAST = 2      # the release keeps its last 4 of 24 layers in MXFP8; the tiny model its last 2 of 6
