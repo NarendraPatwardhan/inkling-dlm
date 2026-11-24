@@ -114,6 +114,7 @@ def run_training(cfg, bundle, tracker_factory, data=None) -> dict:
         ev = heldout_ce(pm, evals, cfg, adapters=True)
         tracker.log({f"eval/heldout_{k}": v for k, v in ev.items()}, update=0)
     params = bundle.lora + bundle.fwd
+    apply_memory_setting(cfg, bundle)
     pm.train()
     if torch.device(dev).type == "cuda":
         torch.cuda.reset_peak_memory_stats()

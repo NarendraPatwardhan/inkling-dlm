@@ -1,5 +1,5 @@
 # Main run on one Colab A100 40 GB (any A100): experts stay packed NVFP4/MXFP8 (docs/RUNBOOK.md, 4-bit route).
-# The gates may switch grad_ckpt on / lower micro_blocks and record the setting in run_dir/gates.json.
+# micro_blocks / grad_ckpt / dequant_chunk_mb are replaced by the setting the gates measured (run_dir/gates.json).
 name: main
 device: cuda
 dtype: bfloat16
@@ -14,8 +14,8 @@ clip: 0.5
 seed: 42
 lora_r: 1024
 lora_alpha: 1024
-micro_blocks: 16
-grad_ckpt: false
+micro_blocks: 64
+grad_ckpt: true
 maxlen: 256
 run_dir: /content/drive/MyDrive/inkling-dlm/runs/main
 stage_dir: /content/stage
@@ -27,7 +27,15 @@ eval_batches: 4
 gate_updates: 30
 cu_per_hour: 8.88
 cu_limit: 200
-mem_limit_gb: 38
+mem_limit_gb: 36
+# Memory/speed ladder (gates.choose_setting): every [grad_ckpt, micro_blocks] is probed on the worst-memory update
+# (16 rows with the most blocks) plus probe_updates timed updates; the fastest that fits mem_limit_gb (allocated) and
+# 95 % of the card (reserved) is kept in gates.json. If none fits, the same ladder with the expert decode bounded to
+# dequant_fallback_mb. Sizing in docs/RUNBOOK.md ("Batch sizing on 40 GB").
+gate_settings: [[true, 128], [true, 64], [true, 32], [false, 16]]
+probe_updates: 4
+dequant_chunk_mb: null
+dequant_fallback_mb: 192
 wandb_mode: online
 wandb_key_file: /content/wandb.key
 tags: [a100, main]

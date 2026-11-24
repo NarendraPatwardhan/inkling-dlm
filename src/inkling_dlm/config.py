@@ -41,8 +41,9 @@ class RunConfig:
     seed: int = 42
     lora_r: int = 1024
     lora_alpha: int = 1024
-    micro_blocks: int = 16
-    grad_ckpt: bool = False
+    micro_blocks: int = 16                # canvases per forward/backward (an update's canvases run in ceil(Bc/micro))
+    grad_ckpt: bool = False               # layer checkpointing (+ Unsloth's message-residual recompute)
+    dequant_chunk_mb: int | None = None   # bound on one packed expert stack's BF16 decode (None: whole stack)
     # bookkeeping
     run_dir: str = "/content/drive/MyDrive/inkling-dlm/runs/main"
     stage_dir: str = "/content/stage"
@@ -53,6 +54,9 @@ class RunConfig:
     stop_after: int | None = None         # stop (cleanly, after a save) at this update: pilots and resume checks
     # gates and cost
     gate_updates: int = 30
+    probe_updates: int = 4                # timed updates per candidate setting (after the peak-memory update)
+    gate_settings: list = field(default_factory=lambda: [[True, 64], [True, 32], [False, 16]])  # [grad_ckpt, micro]
+    dequant_fallback_mb: int | None = 192  # if no setting fits: the ladder again with the decode bounded to this
     cu_per_hour: float = 8.88
     cu_limit: float = 200.0
     mem_limit_gb: float = 38.0            # also capped at 92% of the device by the speed gate

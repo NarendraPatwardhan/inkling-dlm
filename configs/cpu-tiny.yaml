@@ -15,6 +15,8 @@ keep: 2
 eval_every: 6
 eval_batches: 1
 gate_updates: 4
+probe_updates: 1
+gate_settings: [[false, 8], [true, 4]]
 sample_max_blocks: 2
 copy_cases: 8
 cu_limit: 1.0e+12

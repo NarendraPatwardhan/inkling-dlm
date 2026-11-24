@@ -39,14 +39,28 @@ def g_hardware(cfg, min_gpu_gb: float = 39.0):
     gb = p.total_memory / 1e9
     cap = torch.cuda.get_device_capability()
     need = min_gpu_gb if cfg.experts_impl == quant.IMPL else 70.0
+    alloc = os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get("PYTORCH_CUDA_ALLOC_CONF") or ""
     return result("G-hardware", gb >= need and cap >= (8, 0),
-                  f"{p.name}, {gb:.1f} GB, capability {cap} (need >= {need:.0f} GB, sm80+)", gpu_gb=gb,
-                  gpu=p.name)
+                  f"{p.name}, {gb:.1f} GB, capability {cap} (need >= {need:.0f} GB, sm80+); allocator {alloc!r}",
+                  gpu_gb=gb, gpu=p.name, alloc_conf=alloc)
+
+
+def _message_parts(bundle, lm):
+    """(message-gate weights, those not 16/32-bit or packed, message residuals under Unsloth's checkpoint)."""
+    gates_w = [(n, p) for n, p in lm.named_parameters() if "message_gate" in n]
+    bad = [n for n, p in gates_w if quant.is_new_packed_expert_param(p)
+           or p.dtype not in (torch.bfloat16, torch.float16, torch.float32)]
+    return gates_w, bad, unsloth_ops.message_inputs_checkpointed(lm)
 
 
 def g_load(bundle, cfg):
     if cfg.tiny:
-        return result("G-load", True, "tiny random model (no checkpoint to load)", skipped=True)
+        lm = bundle.pm.base_model.model
+        gates_w, bad, n_msg = _message_parts(bundle, lm)
+        return result("G-load", bool(gates_w) and not bad and n_msg == bundle.message_ckpt > 0,
+                      f"tiny random model (no checkpoint to load); message gates 16-bit {len(gates_w) - len(bad)}/"
+                      f"{len(gates_w)}; message residuals under Unsloth's checkpoint {n_msg}", skipped=True,
+                      message_residuals_checkpointed=n_msg)
     info = bundle.load_info or {}
     missing = list(info.get("missing_keys", []))
     unexpected = [k for k in info.get("unexpected_keys", []) if "visual" not in k and "mtp" not in k]
@@ -354,10 +368,32 @@ def mem_limit_gb(cfg) -> float:
     return cfg.mem_limit_gb
 
 
-def g_speed(bundle, cfg, batches, tracker=None):
+def reserved_limit_gb(cfg) -> float:
+    if cfg.device.startswith("cuda") and torch.cuda.is_available():
+        return 0.95 * torch.cuda.get_device_properties(0).total_memory / 1e9
+    return float("inf")
+
+
+def setting(cfg) -> dict:
+    return dict(grad_ckpt=cfg.grad_ckpt, micro_blocks=cfg.micro_blocks, dequant_chunk_mb=cfg.dequant_chunk_mb)
+
+
+def apply_setting(cfg, bundle, grad_ckpt, micro_blocks, dequant_chunk_mb=None):
+    cfg.grad_ckpt, cfg.micro_blocks, cfg.dequant_chunk_mb = bool(grad_ckpt), int(micro_blocks), dequant_chunk_mb
+    lm = bundle.pm.base_model.model
+    if cfg.grad_ckpt:
+        lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    else:
+        lm.gradient_checkpointing_disable()
+    set_dequant_chunk_mb(dequant_chunk_mb)
+
+
+def g_speed(bundle, cfg, batches, tracker=None, peak=None, name="G-mem/speed", check_cost=True, warm=5):
     """Real-data updates in the current setting, each a full update (forward + backward + AdamW step on the
-    trainable tensors, so optimizer state is in the memory peak); project the full run. FAIL if the projection exceeds
-    cfg.cu_limit or peak memory exceeds the limit. Run last: it moves the trainable tensors."""
+    trainable tensors, so optimizer state is in the memory peak); project the full run. `peak` (peak_batch) runs first:
+    the worst update for memory, so the measured peak covers every training update at this micro-batch. FAIL if peak
+    allocated memory exceeds mem_limit_gb, peak reserved exceeds 95 % of the card, or (check_cost) the projection exceeds
+    cfg.cu_limit. Run last: it moves the trainable tensors."""
     from .train import make_optimizer
     pm, dev = bundle.pm, cfg.device
     pm.train()
@@ -366,7 +402,8 @@ def g_speed(bundle, cfg, batches, tracker=None):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
     times, toks, slots = [], [], []
-    for i, ex in enumerate(batches):
+    peak_blocks = 0
+    for i, ex in enumerate(([peak] if peak else []) + list(batches)):
         b = collate(ex, i, cfg.seed, dev, cfg.block)
         sync(dev)
         t0 = time.time()
@@ -375,6 +412,9 @@ def g_speed(bundle, cfg, batches, tracker=None):
         opt.step()
         opt.zero_grad(set_to_none=True)
         sync(dev)
+        if peak and i == 0:
+            peak_blocks = out["blocks"]
+            continue
         times.append(time.time() - t0)
         toks.append(int(b["lens"].sum()))
         slots.append(out["blocks"] * (S + 1))
@@ -382,25 +422,64 @@ def g_speed(bundle, cfg, batches, tracker=None):
             tracker.log({"gate_speed/s_per_update": times[-1], "gate_speed/loss": out["loss"],
                          "gate_speed/blocks": out["blocks"], "gate_speed/tower_tokens": toks[-1],
                          "gate_speed/tokens_per_s": toks[-1] / times[-1],
-                         "gate_speed/peak_mem_gb": peak_mem_gb(dev)})
+                         "gate_speed/peak_mem_gb": peak_mem_gb(dev), "gate_speed/peak_reserved_gb":
+                         peak_reserved_gb(dev), "gate_speed/micro_blocks": cfg.micro_blocks,
+                         "gate_speed/grad_ckpt": int(cfg.grad_ckpt)})
     del opt
-    warm = min(5, len(times) - 1)
+    warm = min(warm, len(times) - 1)
     s = float(np.median(times[warm:]))
     tps = float(np.sum(toks[warm:]) / np.sum(times[warm:]))
     cps = float(np.sum(slots[warm:]) / np.sum(times[warm:]))
-    mem = peak_mem_gb(dev)
-    lim = mem_limit_gb(cfg)
+    mem, res = peak_mem_gb(dev), peak_reserved_gb(dev)
+    lim, rlim = mem_limit_gb(cfg), reserved_limit_gb(cfg)
     p = projection(s, cfg.updates, cfg.cu_per_hour)
-    ok = mem < lim and p["train_cu"] <= cfg.cu_limit
-    return result("G-mem/speed", ok, f"grad_ckpt={cfg.grad_ckpt} micro={cfg.micro_blocks}: median {s:.2f} s/update, "
-                  f"{tps:.0f} tower tokens/s, {cps:.0f} canvas slots/s, peak {mem:.1f} GB (limit {lim:.1f}) -> "
-                  f"projected {p['train_hours']:.1f} h = {p['train_cu']:.0f} CU at {cfg.cu_per_hour} CU/h (limit "
-                  f"{cfg.cu_limit:.0f})", peak_mem_gb=mem, mem_limit_gb=lim, tokens_per_s=tps,
-                  canvas_slots_per_s=cps, **p)
+    fits = mem < lim and res < rlim
+    ok = fits and (p["train_cu"] <= cfg.cu_limit or not check_cost)
+    st = setting(cfg)
+    return result(name, ok, f"grad_ckpt={cfg.grad_ckpt} micro={cfg.micro_blocks} dequant_chunk_mb="
+                  f"{cfg.dequant_chunk_mb}: median {s:.2f} s/update, {tps:.0f} tower tokens/s, {cps:.0f} canvas "
+                  f"slots/s, peak {mem:.1f} GB allocated (limit {lim:.1f}), {res:.1f} GB reserved (limit {rlim:.1f}), "
+                  f"peak update {peak_blocks} canvases -> projected {p['train_hours']:.1f} h = {p['train_cu']:.0f} "
+                  f"CU at {cfg.cu_per_hour} CU/h (limit {cfg.cu_limit:.0f})", peak_mem_gb=mem, peak_reserved_gb=res,
+                  mem_limit_gb=lim, reserved_limit_gb=rlim, fits=fits, peak_update_blocks=peak_blocks,
+                  tokens_per_s=tps, canvas_slots_per_s=cps, **st, **p)
+
+
+def choose_setting(bundle, cfg, probe, peak, tracker=None):
+    """Probe every (grad_ckpt, micro_blocks) in cfg.gate_settings on the peak update plus `probe` timed updates and
+    keep the fastest one that fits; if none fits, the same ladder again with the expert decode bounded to
+    cfg.dequant_fallback_mb. Returns (probe results, chosen setting or None)."""
+    res, fit = [], []
+    ladders = [[(ck, m, cfg.dequant_chunk_mb) for ck, m in cfg.gate_settings]]
+    if cfg.dequant_fallback_mb:
+        ladders.append([(ck, m, cfg.dequant_fallback_mb) for ck, m in cfg.gate_settings])
+    for ladder in ladders:
+        for ck, micro, chunk in ladder:
+            apply_setting(cfg, bundle, ck, micro, chunk)
+            tag = f"G-mem/speed (probe ckpt={ck} micro={micro} chunk={chunk})"
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            try:
+                r = g_speed(bundle, cfg, probe, tracker, peak=peak, name=tag, check_cost=False, warm=1)
+            except torch.OutOfMemoryError:
+                bundle.pm.zero_grad(set_to_none=True)
+                r = result(tag, False, f"OOM with grad_ckpt={ck} micro={micro} dequant_chunk_mb={chunk}",
+                           fits=False, grad_ckpt=ck, micro_blocks=micro, dequant_chunk_mb=chunk)
+            res.append(r)
+            if r["metrics"].get("fits"):
+                fit.append(r)
+        if fit:
+            break
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if not fit:
+        return res, None
+    best = min(fit, key=lambda r: r["metrics"]["s_per_update"])["metrics"]
+    return res, (best["grad_ckpt"], best["micro_blocks"], best["dequant_chunk_mb"])
 
 
 # ------------------------------------------------------------------------------------------------ driver
-def run_gates(cfg, bundle, tracker, groups=None, speed=None, pre=None) -> dict:
+def run_gates(cfg, bundle, tracker, groups=None, speed=None, pre=None, peak=None) -> dict:
     t0 = time.time()
     res = list(pre or []) + [g_load(bundle, cfg)]
     if not res[-1]["passed"]:
@@ -410,38 +489,30 @@ def run_gates(cfg, bundle, tracker, groups=None, speed=None, pre=None) -> dict:
     for fn in (g_exact, g_readonly, g_grad, g_ckpt):
         res.append(fn(bundle, cfg, groups))
     if all(r["passed"] for r in res):
-        speed = speed if speed is not None else speed_batches(cfg, bundle.tok, cfg.gate_updates)
-        # settings tried in order until one passes: as configured, then checkpointing on, then smaller micro-batches
-        tries = [(cfg.grad_ckpt, cfg.micro_blocks)]
-        tries += [(True, m) for m in (cfg.micro_blocks, cfg.micro_blocks // 2, cfg.micro_blocks // 4)
-                  if m >= 4 and (True, m) not in tries]
-        for n, (ck, micro) in enumerate(tries):
-            cfg.grad_ckpt, cfg.micro_blocks = ck, micro
-            lm = bundle.pm.base_model.model
-            if ck:
-                lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-            else:
-                lm.gradient_checkpointing_disable()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        speed = speed if speed is not None else speed_batches(cfg, bundle.tok, cfg.gate_updates + cfg.probe_updates)
+        peak = peak if peak is not None else peak_batch(cfg, bundle.tok)
+        probe, timed = speed[:cfg.probe_updates], speed[cfg.probe_updates:] or speed
+        probes, best = choose_setting(bundle, cfg, probe, peak, tracker)
+        res += probes
+        if best is None:
+            res.append(result("G-mem/speed", False, "no setting in gate_settings fits the memory limits"))
+        else:
+            apply_setting(cfg, bundle, *best)
+            print(f"[gates] fastest fitting setting: grad_ckpt={best[0]} micro={best[1]} dequant_chunk_mb={best[2]}",
+                  flush=True)
             try:
-                r = g_speed(bundle, cfg, speed, tracker)
+                res.append(g_speed(bundle, cfg, timed, tracker, peak=peak))
             except torch.OutOfMemoryError:
                 bundle.pm.zero_grad(set_to_none=True)
-                r = result("G-mem/speed", False, f"OOM with grad_ckpt={ck} micro={micro}")
-            if r["passed"] or n == len(tries) - 1:
-                res.append(r)
-                break
-            res.append(r | {"gate": f"G-mem/speed (tried ckpt={ck} micro={micro})"})
-            print("[gates] speed gate failed in this setting; trying the next one", flush=True)
+                res.append(result("G-mem/speed", False, f"OOM in the full run of the chosen setting {best}"))
     return _finish(cfg, tracker, res, t0)
 
 
 def _finish(cfg, tracker, res, t0):
-    passed = all(r["passed"] for r in res if not r["gate"].startswith("G-mem/speed (tried"))
+    passed = all(r["passed"] for r in res if not r["gate"].startswith("G-mem/speed ("))
     speed = next((r for r in reversed(res) if r["gate"] == "G-mem/speed"), None)
     out = dict(passed=passed, gates=res, seconds=time.time() - t0,
-               setting=dict(grad_ckpt=cfg.grad_ckpt, micro_blocks=cfg.micro_blocks),
+               setting=setting(cfg),
                projection=speed["metrics"] if speed else None)
     tracker.gates(res)
     for r in res:
@@ -449,7 +520,7 @@ def _finish(cfg, tracker, res, t0):
             if isinstance(v, (int, float, bool)):
                 tracker.summary({f"gate_metrics/{r['gate']}/{k}": v})
     tracker.summary({"gates/seconds": out["seconds"], "gates/grad_ckpt": cfg.grad_ckpt,
-                     "gates/micro_blocks": cfg.micro_blocks})
+                     "gates/micro_blocks": cfg.micro_blocks, "gates/dequant_chunk_mb": cfg.dequant_chunk_mb or 0})
     Path(cfg.run_dir).mkdir(parents=True, exist_ok=True)
     (Path(cfg.run_dir) / "gates.json").write_text(json.dumps(out, indent=1, default=str))
     print(f"[gates] {'ALL PASSED' if passed else 'FAILED'} in {out['seconds']:.0f} s", flush=True)

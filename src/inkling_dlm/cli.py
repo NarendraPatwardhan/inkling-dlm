@@ -6,8 +6,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
+
+# Before torch touches CUDA: expandable segments against fragmentation (what unsloth_zoo sets on import; set here
+# explicitly so it holds whatever imports first). An explicit user setting wins.
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
 from .config import load_config
 
@@ -45,6 +50,7 @@ def apply_gate_setting(cfg) -> dict | None:
     if g.get("passed"):
         cfg.grad_ckpt = g["setting"]["grad_ckpt"]
         cfg.micro_blocks = g["setting"]["micro_blocks"]
+        cfg.dequant_chunk_mb = g["setting"].get("dequant_chunk_mb")
     return g
 
 
