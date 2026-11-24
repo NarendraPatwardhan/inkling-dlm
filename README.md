@@ -26,6 +26,7 @@ src/inkling_dlm/
   patches.py        PrefixView, mask/relative-distance geometry, forward-bias bank, runtime patches
   model.py          real model loader (packed 4-bit experts, eager attention) and tiny random Inkling; LoRA
   quant.py          the release's NVFP4/MXFP8 experts kept packed, decoded per layer by Unsloth's kernels
+  unsloth_ops.py    Unsloth's Inkling techniques: message-residual recompute, chunked softcapped CE, decode bound
   tower.py          frozen tower fill, state compaction, canvas forward (softcapped logits)
   data.py           LAD selection, chat encoding, length-bucketed order, block collation
   loss.py           block loss
@@ -73,7 +74,8 @@ cost) are the stage-1 gates on the A100.
 `transformers==5.24.0`, `peft==0.22.0`, `accelerate==1.16.0`; model `thinkingmachines/Inkling-2-Mini@b85c3cf`;
 data `Ruurd/LAD-training-1m-256@6041513`. torch ≥ 2.9 (grouped_mm on sm80). Unsloth (`unsloth` + `unsloth_zoo`, pinned
 commits in `constants.UNSLOTH`), installed with `pip install --no-deps` because their pins cap transformers at 5.18;
-only `unsloth_zoo.packed_experts` is imported.
+`import unsloth` never runs: the loop uses `unsloth_zoo.packed_experts`, `unsloth_zoo.fused_losses.chunked_logprob`
+and `unsloth/models/inkling2.py` loaded on its own (see `unsloth_ops.py` and docs/RUNBOOK.md).
 
 ## License
 
