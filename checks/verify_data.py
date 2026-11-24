@@ -1,5 +1,5 @@
-"""Data pipeline on real LAD rows: the shipped selection index, chat encoding, batched == single encoding,
-truncation, compact storage and length-bucketed order."""
+"""Data pipeline on real LAD rows: the shipped selection index, chat encoding (equal to Inkling's own chat template),
+batched == single encoding, truncation, compact storage and length-bucketed order."""
 import numpy as np
 
 from inkling_dlm import constants as K
@@ -74,3 +74,23 @@ def check_full_selection_matches_the_guide(cfg, bundle):
     data, _ = load_training_examples(c, bundle.tok)
     want = json.loads((Path(__file__).with_name("expected_data_stats.json")).read_text())
     assert data_stats(data) == want
+
+
+def check_encoding_equals_inkling_chat_template(cfg, bundle):
+    """Unsloth's guide formats data with Inkling's own chat template (reasoning_effort controls the thinking line).
+    The hand-built encoding must be token-for-token the template with reasoning_effort=0 ("none"): system, the
+    "Thinking effort level: 0" system line, user, then the model turn ending <|end_message|><|content_model_end_sampling|>."""
+    tok = bundle.tok
+    rows = lad_rows(cfg, "train", selection_index()[:64])
+    n = 0
+    for r in rows:
+        p, a, ended = encode(tok, r, 10_000)
+        user = r["instruction"] if not r["input"] else f"{r['instruction']}\n\n{r['input']}"
+        conv = [{"role": "system", "content": (r["system"] or K.DEFAULT_SYSTEM).strip()},
+                {"role": "user", "content": user}, {"role": "assistant", "content": r["output"]}]
+        for effort in (0, "none"):
+            ids = tok.apply_chat_template(conv, tokenize=True, reasoning_effort=effort)
+            ids = ids["input_ids"] if isinstance(ids, dict) or hasattr(ids, "keys") else ids
+            assert list(ids) == p + a, r["instruction"][:60]
+        n += 1
+    assert n == 64
