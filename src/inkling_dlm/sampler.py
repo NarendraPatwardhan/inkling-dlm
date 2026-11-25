@@ -4,7 +4,8 @@ from __future__ import annotations
 import torch
 
 from .constants import EOS_ID, END_MSG_ID, MASK_ID, S
-from .tower import canvas_logits, tower_fill, view_from_inference_cache
+from .loopcd import guided_logits
+from .tower import tower_fill, view_from_inference_cache
 
 
 def per_step(n: int, steps: int) -> list[int]:
@@ -14,10 +15,12 @@ def per_step(n: int, steps: int) -> list[int]:
 
 @torch.no_grad()
 def generate(peft_model, prompt_ids, max_blocks=8, steps_per_block=32, block=S, temperature=0.0, generator=None,
-             trace=None):
+             trace=None, loopcd=None):
     """prompt_ids ends with <|message_model|><|content_text|>; its last token is the first anchor.
     block <= 32 (sampling blocks larger than the training block collapse). An end token may be committed only at the
-    leftmost masked slot. If `trace` is a list, per-step (block, step, committed slots) records are appended."""
+    leftmost masked slot. If `trace` is a list, per-step (block, step, committed slots) records are appended.
+    loopcd: a loopcd.Spec; its guided logits pick both the token and the confidence that orders unmasking (temperature
+    applies after guidance, paper App. A.3). None or off at full depth is the plain path."""
     assert 1 <= block <= S
     dev = next(peft_model.parameters()).device
     ids = torch.tensor([list(prompt_ids)], device=dev)
@@ -33,7 +36,7 @@ def generate(peft_model, prompt_ids, max_blocks=8, steps_per_block=32, block=S, 
         live[:block] = True                                      # slots beyond `block` stay masked and unused
         idx = torch.arange(S, device=dev)
         for si, k in enumerate(per_step(block, min(steps_per_block, block))):
-            logits = canvas_logits(peft_model, view, x)[0]       # (S, V): row j predicts block slot j
+            logits = guided_logits(peft_model, view, x, loopcd)[0]   # (S, V): row j predicts block slot j
             if temperature > 0:
                 probs = torch.softmax(logits / temperature, -1)
                 pred = torch.multinomial(probs, 1, generator=generator)[:, 0]

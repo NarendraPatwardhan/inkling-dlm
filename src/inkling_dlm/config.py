@@ -12,6 +12,19 @@ import yaml
 from . import constants as K
 
 
+def _grid() -> list[dict]:
+    """Paper ranges (Sec. 5.3, App. B.4, Tables A4/A8): fixed w 0.2-0.3 for generation, 0.5 for scoring, collapse
+    beyond ~0.6 in AR generation; adaptive caps 0.25-1.5; hidden-state w 0.3-1.0; reduced depth uses fixed w only."""
+    g = [dict(mode="off")]
+    g += [dict(mode="logits", w=w) for w in (0.1, 0.2, 0.3, 0.5, 1.0)]
+    g += [dict(mode="logits", w=w, adaptive=True) for w in (0.25, 0.5, 1.0, 1.5)]
+    g += [dict(mode="hidden", w=w) for w in (0.2, 0.3, 0.5, 0.75, 1.0)]
+    g += [dict(mode="off", passes=2), dict(mode="logits", w=0.3, passes=2), dict(mode="logits", w=0.5, passes=2),
+          dict(mode="hidden", w=0.5, passes=2)]
+    return g
+
+
+
 @dataclass
 class RunConfig:
     name: str = "main"                    # run name suffix; W&B name = f"{job}-{name}"
@@ -66,6 +79,14 @@ class RunConfig:
     # sanity
     sample_max_blocks: int = 8
     copy_cases: int = 200
+    # LoopCD (arXiv 2610.02185; loopcd.py). Off by default: the sampler is unchanged.
+    loopcd: str = "off"                   # off | logits (Eq. 3) | hidden (Eq. 2)
+    loopcd_w: float = 0.0                 # fixed strength, or w_max with loopcd_adaptive
+    loopcd_adaptive: bool = False         # Eq. 4 token-level margin gate (logits only)
+    loopcd_passes: int | None = None      # core passes on the canvas (None: 3; 2 = reduced depth, Sec. 4.3)
+    loopcd_sweep: list = field(default_factory=_grid)   # post-training eval grid ([] skips it)
+    loopcd_micro: int = 16                # canvases per guided forward (full fp32 logits are kept, no grad)
+    loopcd_gen_steps: int = 16            # sampler steps per block in the sweep's generation pass (0 skips it)
     # tracking (the key comes from WANDB_API_KEY or wandb_key_file, never from this config)
     wandb_entity: str = "narendra-patwardhan-independent"
     wandb_project: str = "inkling-dlm"
