@@ -1,6 +1,6 @@
 """Command line: `python -m inkling_dlm <job> --config configs/a100.yaml [key=value ...]`.
 
-Jobs: gates | train | sanity | pipeline (gates -> train -> sanity) | data-stats.
+Jobs: gates | train | sanity | loopcd (sweep only, on a saved state) | pipeline (gates -> train -> sanity) | data-stats.
 Real training refuses to start unless the gates passed for this run_dir and `--approved` is given."""
 from __future__ import annotations
 
@@ -76,6 +76,24 @@ def job_sanity(cfg, state=None, bundle=None) -> dict:
     return out
 
 
+def job_loopcd(cfg, state=None, bundle=None) -> list[dict]:
+    """cfg.loopcd_sweep on a trained state (sanity runs it too); W&B job `loopcd`, rows in run_dir/loopcd.json."""
+    from .checkpoint import load_state
+    from .data import eval_batches
+    from .sanity import log_loopcd, loopcd_sweep
+    bundle = bundle or _bundle(cfg)
+    if load_state(cfg, bundle.pm, path=state) is None:
+        raise SystemExit(f"no complete state in {cfg.run_dir}")
+    bundle.pm.eval()
+    tr = _tracker(cfg, "loopcd")
+    rows = loopcd_sweep(bundle.pm, bundle.tok, cfg, eval_batches(cfg, bundle.tok, 8))
+    log_loopcd(tr, rows)
+    Path(cfg.run_dir).mkdir(parents=True, exist_ok=True)
+    (Path(cfg.run_dir) / "loopcd.json").write_text(json.dumps(rows, indent=1))
+    tr.finish()
+    return rows
+
+
 def job_data_stats(cfg) -> dict:
     from .data import data_stats, load_training_examples
     from .model import load_tokenizer
@@ -87,10 +105,10 @@ def job_data_stats(cfg) -> dict:
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="inkling-dlm")
-    ap.add_argument("job", choices=["gates", "train", "sanity", "pipeline", "data-stats"])
+    ap.add_argument("job", choices=["gates", "train", "sanity", "loopcd", "pipeline", "data-stats"])
     ap.add_argument("--config", default=None)
     ap.add_argument("--approved", action="store_true", help="the owner approved the main training run")
-    ap.add_argument("--state", default=None, help="state directory for sanity (default: newest)")
+    ap.add_argument("--state", default=None, help="state directory for sanity/loopcd (default: newest)")
     ap.add_argument("overrides", nargs="*", help="key=value config overrides")
     a = ap.parse_args(argv)
     cfg = load_config(a.config, a.overrides)
@@ -100,6 +118,8 @@ def main(argv=None):
         job_train(cfg, a.approved)
     elif a.job == "sanity":
         job_sanity(cfg, a.state)
+    elif a.job == "loopcd":
+        job_loopcd(cfg, a.state)
     elif a.job == "data-stats":
         job_data_stats(cfg)
     elif a.job == "pipeline":

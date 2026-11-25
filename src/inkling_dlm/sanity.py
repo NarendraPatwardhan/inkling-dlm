@@ -1,5 +1,5 @@
 """Post-training sanity checks: held-out masked loss (parent init vs trained), bidirectional copy test, diffusion
-samples on code prompts against the parent's AR decode. Everything goes to W&B (tables + plots) and sanity.json."""
+samples on code prompts against the parent's AR decode, and the LoopCD sweep (cfg.loopcd_sweep). Everything goes to W&B (tables + plots) and sanity.json."""
 from __future__ import annotations
 
 import ast
@@ -14,7 +14,8 @@ import torch
 from .checkpoint import load_state
 from .constants import MASK_ID, S
 from .data import collate, encode, eval_batches
-from .evaluate import T_GRID, heldout_ce, tower_states
+from .evaluate import T_GRID, heldout_ce, heldout_guided, tower_states
+from .loopcd import spec_of, sweep_of
 from .sampler import generate
 from .tower import canvas_logits, view_for_batch
 
@@ -90,7 +91,7 @@ def samples(pm, tok, cfg, prompts=CODE_PROMPTS, ar_tokens=256) -> list[dict]:
         row = {"prompt": p, "ar": tok.decode(ar, skip_special_tokens=True), "s_ar": time.time() - t0}
         for steps in (32, 16):
             t0 = time.time()
-            out = generate(pm, ids, max_blocks=cfg.sample_max_blocks, steps_per_block=steps)
+            out = generate(pm, ids, max_blocks=cfg.sample_max_blocks, steps_per_block=steps, loopcd=spec_of(cfg))
             row[f"dlm_nfe{steps}"] = tok.decode(out, skip_special_tokens=True)
             row[f"s_nfe{steps}"] = time.time() - t0
             row[f"tokens_nfe{steps}"] = len(out)
@@ -99,6 +100,45 @@ def samples(pm, tok, cfg, prompts=CODE_PROMPTS, ar_tokens=256) -> list[dict]:
         rows.append(row)
         print(json.dumps(row)[:300], flush=True)
     return rows
+
+
+LOOPCD_COLS = ["spec", "mode", "w", "adaptive", "passes", "ce", "top1"] + [f"ce_t{t:.1f}" for t in T_GRID] + [
+    "parse_rate", "tokens", "s_gen"]
+
+
+@torch.no_grad()
+def loopcd_sweep(pm, tok, cfg, groups, prompts=CODE_PROMPTS) -> list[dict]:
+    """Every spec in cfg.loopcd_sweep on the trained adapters: guided held-out CE/top-1 on the fixed masks, and (if
+    loopcd_gen_steps) greedy diffusion samples on the code prompts with their parse rate."""
+    rows = []
+    for sp in sweep_of(cfg):
+        r = {"spec": sp.name} | sp.to_dict() | heldout_guided(pm, groups, cfg, sp)
+        if cfg.loopcd_gen_steps:
+            t0, ok, n = time.time(), [], 0
+            for p in prompts:
+                out = generate(pm, prompt_ids(tok, p), max_blocks=cfg.sample_max_blocks,
+                               steps_per_block=cfg.loopcd_gen_steps, loopcd=sp)
+                ok.append(parses(tok.decode(out, skip_special_tokens=True)))
+                n += len(out)
+            r |= {"parse_rate": float(np.mean(ok)), "tokens": n, "s_gen": time.time() - t0}
+        else:
+            r |= {"parse_rate": float("nan"), "tokens": 0, "s_gen": 0.0}
+        rows.append(r)
+        print(json.dumps({k: r[k] for k in ("spec", "ce", "top1", "parse_rate")}), flush=True)
+    return rows
+
+
+def log_loopcd(tracker, rows):
+    tracker.table("loopcd/sweep", LOOPCD_COLS, [[r[c] for c in LOOPCD_COLS] for r in rows])
+    base = next((r for r in rows if r["mode"] == "off" and r["passes"] is None), None)
+    best = min(rows, key=lambda r: r["ce"])
+    d = {f"loopcd/{r['spec']}/{k}": r[k] for r in rows for k in ("ce", "top1", "parse_rate")}
+    d |= {"loopcd/best_spec": best["spec"], "loopcd/best_ce": best["ce"]}
+    if base:
+        d["loopcd/best_dce"] = best["ce"] - base["ce"]
+    tracker.summary(d)
+    tracker.bar("loopcd/ce", [r["spec"] for r in rows], [r["ce"] for r in rows], "spec", "held-out CE",
+                "LoopCD sweep: guided held-out masked CE")
 
 
 def run_sanity(cfg, bundle, tracker, state_path=None, groups=None, prompts=CODE_PROMPTS) -> dict:
@@ -136,6 +176,9 @@ def run_sanity(cfg, bundle, tracker, state_path=None, groups=None, prompts=CODE_
             "s_ar", "s_nfe32", "s_nfe16"]
     tracker.table("sanity/samples", cols, [[r[c] for c in cols] for r in rows])
     out = dict(state=st["path"], step=st["step"], init=init, final=final | {"samples": rows})
+    if cfg.loopcd_sweep:
+        out["loopcd"] = loopcd_sweep(pm, tok, cfg, groups, prompts)
+        log_loopcd(tracker, out["loopcd"])
     Path(cfg.run_dir).mkdir(parents=True, exist_ok=True)
     (Path(cfg.run_dir) / "sanity.json").write_text(json.dumps(out, indent=1))
     return out

@@ -26,3 +26,11 @@ cache_dir: .verify/cache
 data_local_dir: null
 wandb_mode: offline
 tags: [cpu, verify]
+loopcd_micro: 8
+loopcd_gen_steps: 4
+loopcd_sweep:
+  - {mode: "off"}
+  - {mode: logits, w: 0.3}
+  - {mode: logits, w: 1.0, adaptive: true}
+  - {mode: hidden, w: 0.5}
+  - {mode: logits, w: 0.5, passes: 2}

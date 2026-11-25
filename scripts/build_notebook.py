@@ -16,7 +16,7 @@ This notebook drives the `inkling_dlm` package (https://github.com/NarendraPatwa
    speed with the **projected compute-unit cost**. Any failure — including a projection above 200 CU — stops here.
 2. **Stage 2 — training** (25,000 updates). Runs **only** when `TRAIN_APPROVED = True` (the owner's approval).
    Detached; checkpoints every 500 updates to Drive; re-running the notebook resumes.
-3. **Stage 3 — sanity checks** (held-out masked CE, copy test, code samples) and **stop the runtime**.
+3. **Stage 3 — sanity checks** (held-out masked CE, copy test, code samples, LoopCD sweep) and **stop the runtime**.
 
 Everything is logged to W&B (`narendra-patwardhan-independent/inkling-dlm`). The key is read from a Colab secret
 (`WANDB_API_KEY`) or `/content/wandb.key` and is never printed. Runtime: **any A100** (40 GB or 80 GB): the routed

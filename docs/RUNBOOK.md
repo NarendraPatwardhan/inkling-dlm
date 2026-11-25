@@ -172,3 +172,27 @@ checkpoints.
 bidirectional copy test (clue vs no clue), 8 code prompts decoded by the parent (AR) and by the diffusion sampler at
 32 and 16 steps per block, with parse rates. W&B: summary, tables, a CE-vs-t line plot and a copy-test bar chart;
 `sanity.json` on Drive. Then `runtime.unassign()` / `colab stop`, and `colab sessions` must show none.
+
+### LoopCD sweep (part of sanity; alone: `python -m inkling_dlm loopcd --config configs/a100.yaml`)
+
+LoopCD ([arXiv 2610.02185](https://arxiv.org/abs/2610.02185)) contrasts the looped core's first pass (h_1, after
+layers 6-17 once) with its final pass (h_3) on every canvas forward, so it applies to every masked slot at every
+denoising step. `src/inkling_dlm/loopcd.py`:
+
+| knob | paper | here |
+|---|---|---|
+| `loopcd=logits` | Eq. 3: z' = z_R + w (z_R - z_1), z = lm_head(coda(h)) | z = softcap(lm_head(norm(final_input(coda(h))))); one extra coda + head pass on h_1 |
+| `loopcd=hidden` | Eq. 2: h' = h_R + w (h_R - h_1), one coda pass | h = (hidden_states, block_states) at the end of the core; pre-loop blocks cancel |
+| `loopcd_adaptive=true` | Eq. 4: w = w_max [1 - (p_(1) - p_(2))], p = softmax(z_R) | per slot; `loopcd_w` is w_max; logits only (Sec. 3.2) |
+| `loopcd_passes=2` | Sec. 4.3 reduced depth (R/2) | 2 of 3 core passes on the canvas, reference h_1; the tower prefix keeps 3 |
+
+No plausibility mask or truncation (the paper has none); temperature applies after guidance (App. A.3). The sampler
+takes both the token and the unmasking confidence from softmax(z'). Default `loopcd=off`: the sampler calls the
+unchanged forward; `w=0` in either form is bit-identical (`checks/verify_loopcd.py`).
+
+Sweep (`loopcd_sweep`, 19 settings): off; logits w ∈ {0.1, 0.2, 0.3, 0.5, 1.0}; logits adaptive w_max ∈ {0.25, 0.5,
+1.0, 1.5}; hidden w ∈ {0.2, 0.3, 0.5, 0.75, 1.0}; at 2 passes: off, logits w 0.3 and 0.5, hidden w 0.5. Each is scored
+by guided held-out masked CE and top-1 on the same fixed masks as `heldout_ce`, and by greedy diffusion samples on
+the 8 code prompts at `loopcd_gen_steps` (16) steps per block (parse rate, tokens, seconds). W&B: `loopcd/sweep`
+table, `loopcd/ce` bar chart, summary `loopcd/<spec>/{ce,top1,parse_rate}` and `loopcd/best_*`; rows in
+`sanity.json["loopcd"]` (or `loopcd.json`). `loopcd_sweep=[]` skips it; `loopcd_gen_steps=0` skips the samples.

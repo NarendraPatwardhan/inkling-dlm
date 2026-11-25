@@ -33,11 +33,12 @@ src/inkling_dlm/
   train.py          training loop (W&B, resume, guards)
   checkpoint.py     atomic Drive checkpoints (last N), full RNG/optimizer/scheduler state
   evaluate.py       held-out masked CE on fixed blocks and masks
-  sampler.py        block-wise low-confidence remasking sampler
+  sampler.py        block-wise low-confidence remasking sampler (optional LoopCD guidance)
+  loopcd.py         LoopCD (arXiv 2610.02185): pass-1 vs pass-3 contrast in logits or hidden space, off by default
   gates.py          pre-training gates (load, dispatch, exactness, read-only, gradients, checkpointing, speed/cost)
-  sanity.py         post-training checks (held-out CE, copy test, code samples) with W&B tables and plots
+  sanity.py         post-training checks (held-out CE, copy test, code samples, LoopCD sweep) with W&B tables/plots
   tracking.py       W&B wrapper (config + git commit, key from env/file, never printed)
-  cli.py            python -m inkling_dlm {gates,train,sanity,pipeline,data-stats}
+  cli.py            python -m inkling_dlm {gates,train,sanity,loopcd,pipeline,data-stats}
 checks/             CPU verification suite (verify_*.py) on a tiny random Inkling
 notebooks/          inkling_dlm_a100.ipynb: gates first, then (approved) training, then sanity
 scripts/            colab_ctl.py: detached GPU jobs on Colab from a shell
